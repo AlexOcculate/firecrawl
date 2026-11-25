@@ -18,10 +18,9 @@ import {
   getDoneJobsOrdered,
 } from "../../lib/crawl-redis";
 import { getJobs, PseudoJob } from "./crawl-status";
-import * as Sentry from "@sentry/node";
 import { getConcurrencyLimitedJobs } from "../../lib/concurrency-limit";
 import { scrapeQueue, NuQJobStatus } from "../../services/worker/nuq-router";
-import { getErrorContactMessage } from "../../lib/deployment";
+import { service } from "../../service";
 
 type ErrorMessage = {
   type: "error";
@@ -217,8 +216,6 @@ export async function crawlStatusWSController(
 
     await crawlStatusWS(ws, req);
   } catch (err) {
-    Sentry.captureException(err);
-
     const id = uuidv7();
     let verbose = JSON.stringify(err);
     if (verbose === "{}") {
@@ -241,7 +238,7 @@ export async function crawlStatusWSController(
     );
     return close(ws, 1011, {
       type: "error",
-      error: getErrorContactMessage(id),
+      error: service.modules.messages.errorContact(id),
     });
   }
 }

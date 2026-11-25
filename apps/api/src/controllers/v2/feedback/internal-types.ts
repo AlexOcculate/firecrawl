@@ -1,12 +1,30 @@
 import { logger as _logger } from "../../../lib/logger";
+import type { SearchResultType } from "../../../lib/entities";
 import {
   EndpointFeedbackEndpoint,
   EndpointFeedbackErrorCode,
   EndpointFeedbackResponse,
   SearchFeedbackErrorCode,
 } from "../types";
+import type { RefundClass } from "../../../lib/feedback-job-store";
 
 export type FeedbackRating = "good" | "partial" | "bad";
+
+/** Feedback on a browser session rather than a job: never refunded. */
+export type SessionFeedbackEndpoint = "interact" | "browser";
+
+export function isSessionEndpoint(
+  endpoint: EndpointFeedbackEndpoint,
+): endpoint is SessionFeedbackEndpoint {
+  return endpoint === "interact" || endpoint === "browser";
+}
+
+/** A valuable result addressed by its group and 1-indexed position in it. */
+export type ValuableResultInput = {
+  source: SearchResultType;
+  position: number;
+  reason?: string;
+};
 
 export type FeedbackInput = {
   rating: FeedbackRating;
@@ -14,6 +32,7 @@ export type FeedbackInput = {
   tags?: string[];
   note?: string;
   valuableSources?: Array<{ url: string; reason?: string }>;
+  valuableResults?: ValuableResultInput[];
   missingContent?: Array<{ topic: string; description?: string }>;
   querySuggestions?: string;
   url?: string;
@@ -32,6 +51,24 @@ export type FeedbackJobRow = {
   created_at: string;
   is_successful: boolean | null;
   options: unknown;
+  /**
+   * Per-source result counts (search only), e.g. `{"web":3,"images":0}`, read
+   * from the Bigtable feedback job. Null on jobs written before the field
+   * existed; `{}` means the search ran and every group was empty.
+   */
+  num_results_by_source?: unknown;
+  /**
+   * Which vertical served each position (search only), e.g.
+   * `{"web":{"1":"developer"}}`. Sparse: untagged results and untagged groups
+   * are absent. Null on jobs written before the field existed and on
+   * zero-data-retention searches.
+   */
+  result_categories?: unknown;
+  feedback_deadline_ms?: number;
+  refund_class?: RefundClass;
+  zero_data_retention?: boolean;
+  /** Interact only: the browser session behind the scrape job. */
+  browser_session_id?: string;
 };
 
 export type FeedbackRecordOptions = {
@@ -58,7 +95,7 @@ export type FeedbackRecordResult = {
 export type RefundPolicySnapshot = {
   version: "feedback_refund_v1";
   enabled: boolean;
-  endpoint: EndpointFeedbackEndpoint;
+  endpoint: EndpointFeedbackEndpoint | "alexandria";
   mode: "none" | "flat" | "percentage_with_cap";
   refundableRatings: FeedbackRating[];
   matchedReason: string;

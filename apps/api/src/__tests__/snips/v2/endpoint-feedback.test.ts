@@ -1,4 +1,10 @@
-import { describeIf, TEST_PRODUCTION, TEST_SUITE_WEBSITE } from "../lib";
+import { randomUUID } from "node:crypto";
+import {
+  describeIf,
+  TEST_PRODUCTION,
+  TEST_SELF_HOST,
+  TEST_SUITE_WEBSITE,
+} from "../lib";
 import {
   endpointFeedback,
   endpointFeedbackRaw,
@@ -10,9 +16,7 @@ import {
   scrapeTimeout,
   searchRawFull,
 } from "./lib";
-import { and, eq } from "drizzle-orm";
-import { db } from "../../../db/connection";
-import * as schema from "../../../db/schema";
+import { writeFeedbackJob } from "../../../lib/feedback-job-store";
 
 let identity: Identity;
 let secondaryIdentity: Identity;
@@ -123,42 +127,91 @@ describeIf(TEST_PRODUCTION)("Generic endpoint feedback tests", () => {
         .toString(16)
         .padStart(12, "0");
 
-    await db.insert(schema.searches).values({
-      id: searchId,
-      request_id: searchId,
-      query: "failed generic feedback search",
-      team_id: identity.teamId,
-      options: { query: "failed generic feedback search" },
-      time_taken: 0,
-      credits_cost: 2,
-      is_successful: false,
-      error: "Synthetic failed search for generic feedback policy coverage.",
-      num_results: 0,
-    });
+    // The feedback policy reads the job's outcome from the feedback job
+    // store, so a failed search is a failed feedback job row.
+    expect(
+      await writeFeedbackJob({
+        endpoint: "search",
+        jobId: searchId,
+        requestId: searchId,
+        teamId: identity.teamId,
+        succeeded: false,
+        creditsBilled: 2,
+        zeroDataRetention: false,
+      }),
+    ).toBe(true);
 
-    try {
+    const failed = await endpointFeedbackRaw(
+      {
+        endpoint: "search",
+        jobId: searchId,
+        rating: "bad",
+        missingContent: [{ topic: "Results" }],
+      },
+      identity,
+    );
+
+    expect(failed.statusCode).toBe(409);
+    expect(failed.body.success).toBe(false);
+    expect(failed.body.feedbackErrorCode).toBe("SEARCH_FAILED");
+  }, 30000);
+
+  it.each(["interact", "browser"] as const)(
+    "rejects %s feedback when the team has no such session",
+    async endpoint => {
       const failed = await endpointFeedbackRaw(
         {
-          endpoint: "search",
-          jobId: searchId,
+          endpoint,
+          jobId: randomUUID(),
           rating: "bad",
-          missingContent: [{ topic: "Results" }],
+          note: "There is no session to rate.",
         },
         identity,
       );
 
-      expect(failed.statusCode).toBe(409);
+      expect(failed.statusCode).toBe(404);
       expect(failed.body.success).toBe(false);
-      expect(failed.body.feedbackErrorCode).toBe("SEARCH_FAILED");
-    } finally {
-      await db
-        .delete(schema.searches)
-        .where(
-          and(
-            eq(schema.searches.id, searchId),
-            eq(schema.searches.team_id, identity.teamId),
-          ),
-        );
-    }
+      expect(failed.body.feedbackErrorCode).toBe("JOB_NOT_FOUND");
+    },
+    30000,
+  );
+});
+
+// Feedback needs database authentication, which self-hosted deployments do
+// not have. The endpoint values must still pass body validation.
+describeIf(TEST_SELF_HOST)("Session feedback on a self-hosted API", () => {
+  it.each(["interact", "browser"] as const)(
+    "accepts the %s endpoint and reports that feedback is unavailable",
+    async endpoint => {
+      const failed = await endpointFeedbackRaw(
+        {
+          endpoint,
+          jobId: randomUUID(),
+          rating: "bad",
+          note: "The page never finished loading.",
+        },
+        identity,
+      );
+
+      expect(failed.statusCode).toBe(503);
+      expect(failed.body.success).toBe(false);
+      expect(failed.body.feedbackErrorCode).toBe("DB_DISABLED");
+    },
+    30000,
+  );
+
+  it("rejects an endpoint that takes no feedback", async () => {
+    const failed = await endpointFeedbackRaw(
+      {
+        endpoint: "crawl" as any,
+        jobId: randomUUID(),
+        rating: "bad",
+        note: "Crawl feedback is not supported.",
+      },
+      identity,
+    );
+
+    expect(failed.statusCode).toBe(400);
+    expect(failed.body.feedbackErrorCode).toBe("INVALID_BODY");
   }, 30000);
 });

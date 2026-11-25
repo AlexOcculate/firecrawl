@@ -1,12 +1,24 @@
+import compression from "compression";
 import express, { Request, Response } from "express";
-import { Agent, fetch } from "undici";
+import { externalRequestId } from "../../lib/external-request-id";
 import { z } from "zod";
 import { v7 as uuidv7 } from "uuid";
-import { config } from "../../config";
 import { logger as rootLogger } from "../../lib/logger";
+import {
+  fetchGovUpstream,
+  fetchResearchUpstream,
+  usOnlySkippedWarning,
+  usOnlyUpstreamRefusal,
+} from "../../lib/research-upstream";
+import { isUsOnly } from "../../lib/us-only";
 import { chargeKeylessCredits } from "../../lib/keyless";
+import {
+  indexDailyLimitRefusal,
+  reserveIndexCalls,
+  type IndexName,
+} from "../../lib/index-daily-limit";
 import { billTeam } from "../../services/billing/credit_billing";
-import { getSearchForcedKind } from "../../lib/zdr-helpers";
+import { getEffectiveSearchForcedKind } from "../../lib/safe-mode";
 import {
   logRequest,
   logResearchEndpoint,
@@ -16,21 +28,41 @@ import type {
   ResearchTableName,
 } from "../../services/logging/log_job";
 import type { RequestWithAuth } from "../v1/types";
-import { wrap } from "../../routes/shared";
-import { integrationSchema } from "../../utils/integration";
+import { checkCreditsMiddleware, wrap } from "../../routes/shared";
+import { SEARCH_CREDITS_FEATURE_ID } from "../../services/autumn/autumn.service";
+import { integrationSchema, resolveIntegration } from "../../utils/integration";
+import { requestOrigin } from "../../lib/request-origin";
 
-const TIMEOUT_MS = 120_000;
 const SEARCH_CREDITS_PER_TEN_RESULTS = 2;
+// Billed developer searches are refused up front when the team can't cover
+// the smallest search charge, the same gate /v2/search applies.
+const searchCreditGate = () =>
+  checkCreditsMiddleware(
+    SEARCH_CREDITS_PER_TEN_RESULTS,
+    SEARCH_CREDITS_FEATURE_ID,
+    { mcpCredits: true },
+  );
 const ZDR_SEARCH_CREDITS_PER_TEN_RESULTS = 10;
+
+const DEVELOPER_SEARCH_TIMEOUT_MS = 15_000;
+const GOV_SEARCH_TIMEOUT_MS = 15_000;
+const PAPER_SEARCH_TIMEOUT_MS = 30_000;
+const PAPER_INSPECT_TIMEOUT_MS = 5_000;
+const SIMILAR_PAPERS_TIMEOUT_MS = 10_000;
+const PAPER_READ_TIMEOUT_MS = 120_000;
+const PROTEIN_LOOKUP_TIMEOUT_MS = 5_000;
+
+// The paper endpoints, all served by the Research Index and limited by its
+// daily budget.
+const RESEARCH_INDEX_KINDS = new Set<ResearchRequestKind>([
+  "research_paper_search",
+  "research_related_papers",
+  "research_paper_read",
+  "research_paper_inspect",
+]);
 
 const FORWARDED_REQUEST_HEADERS = ["accept", "x-request-id"];
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "x-request-id"];
-
-const dispatcher = new Agent({
-  connectTimeout: TIMEOUT_MS,
-  headersTimeout: TIMEOUT_MS,
-  bodyTimeout: TIMEOUT_MS,
-});
 
 const multiString = z
   .union([z.string(), z.array(z.string())])
@@ -60,6 +92,7 @@ const searchPapersSchema = z.strictObject({
   categories: multiString,
   from: dateSchema,
   to: dateSchema,
+  sort: z.enum(["relevance", "date_desc"]).optional(),
   ...commonQuery,
 });
 
@@ -86,9 +119,126 @@ const similarPapersSchema = z.strictObject({
   ...commonQuery,
 });
 
-const githubSearchSchema = z.strictObject({
+const proteinLookupSchema = z.strictObject({
+  protein: z.string().trim().min(1).max(200),
+  organism: z.string().trim().min(1).optional(),
+  ...commonQuery,
+});
+
+const starsSchema = z.coerce.number().int().nonnegative().optional();
+
+const booleanFlag = z
+  .union([z.boolean(), z.enum(["true", "false"])])
+  .optional()
+  .transform(value =>
+    value === undefined ? undefined : value === true || value === "true",
+  );
+
+const developerSearchSchema = z
+  .strictObject({
+    query: z.string().min(1),
+    k: kSchema(100),
+    limit: kSchema(100),
+    types: multiString,
+    repos: multiString,
+    sources: multiString,
+    passages: kSchema(5),
+    highlights: booleanFlag,
+    language: z.string().min(1).optional(),
+    topic: multiString,
+    license: z.string().min(1).optional(),
+    min_stars: starsSchema,
+    max_stars: starsSchema,
+    archived: booleanFlag,
+    fork: booleanFlag,
+    skills: z.enum(["only"]).optional(),
+    ...commonQuery,
+  })
+  .refine(
+    params =>
+      params.k === undefined ||
+      params.limit === undefined ||
+      params.k === params.limit,
+    { message: "k and limit must match when both are sent", path: ["limit"] },
+  )
+  .transform(({ limit, ...params }) => ({ ...params, k: params.k ?? limit }));
+
+const DEVELOPER_SEARCH_QUERY_KEYS = [
+  "query",
+  "k",
+  "types",
+  "repos",
+  "sources",
+  "passages",
+  "language",
+  "topic",
+  "license",
+  "min_stars",
+  "max_stars",
+  "archived",
+  "fork",
+  "skills",
+];
+
+const govSource = z.enum(["web", "gov"]);
+
+const govCite = z.string().trim().min(1);
+
+const govCites = z.array(govCite).min(1).max(32);
+
+const govSearchSchema = z.strictObject({
   query: z.string().min(1),
   k: kSchema(100),
+  jurisdiction: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^us(-[a-z]{2})?$/, {
+      message:
+        'jurisdiction must be "us" for federal, or "us-" plus a two-letter state or territory code, such as "us-ca" or "us-dc"',
+    })
+    .optional(),
+  court: z.string().trim().min(1).optional(),
+  courtType: z
+    .enum([
+      "federal-supreme",
+      "federal-appellate",
+      "federal-district",
+      "federal-bankruptcy",
+      "federal-special",
+      "military",
+      "state-supreme",
+      "state-appellate",
+      "state-trial",
+      "state-special",
+      "state-attorney-general",
+    ])
+    .optional(),
+  cites: z
+    .unknown()
+    .transform((value, ctx) => {
+      const parsed = (Array.isArray(value) ? govCites : govCite).safeParse(
+        value,
+      );
+      if (!parsed.success) {
+        ctx.issues.push(
+          ...parsed.error.issues.map(
+            issue => ({ ...issue, input: value }) as z.core.$ZodRawIssue,
+          ),
+        );
+        return z.NEVER;
+      }
+      const cites = [...new Set([parsed.data].flat())];
+      return cites.length === 1 ? cites[0] : cites;
+    })
+    .optional(),
+  domain: z.string().trim().min(1).optional(),
+  sources: z
+    .union([govSource, z.array(govSource).min(1)])
+    .optional()
+    .transform(value =>
+      value === undefined ? undefined : [...new Set([value].flat())],
+    ),
   ...commonQuery,
 });
 
@@ -100,12 +250,22 @@ type ResearchEndpointConfig = {
     params: Record<string, any>,
     req: RequestWithAuth<any, any, any>,
   ) => string;
-  upstreamPath: (
-    params: Record<string, any>,
-    req: RequestWithAuth<any, any, any>,
-  ) => string;
+  timeoutMs?: number;
   billAs: "scrape" | "search";
-};
+} & (
+  | {
+      upstreamPath: (
+        params: Record<string, any>,
+        req: RequestWithAuth<any, any, any>,
+      ) => string;
+    }
+  | {
+      fetchUpstream: (
+        params: Record<string, any>,
+        headers: Record<string, string>,
+      ) => ReturnType<typeof fetchResearchUpstream>;
+    }
+);
 
 type ResearchController = (req: Request, res: Response) => Promise<any>;
 type ResearchQueryParams = Record<string, any> & {
@@ -155,37 +315,30 @@ function addLegacySnakeCaseAliases<T>(value: T): T {
   return object as T;
 }
 
-function appendQuery(
-  url: URL,
-  params: Record<string, unknown>,
-  allowed: string[],
-) {
-  for (const key of allowed) {
-    const value = params[key];
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item !== undefined && item !== null) {
-          url.searchParams.append(key, String(item));
-        }
-      }
-    } else if (value !== undefined && value !== null) {
-      url.searchParams.append(key, String(value));
-    }
-  }
+const GOV_RESULT_KEYS: Record<string, string> = {
+  court_type: "courtType",
+  cited_as: "citedAs",
+  updated_at: "updatedAt",
+};
+
+function camelCaseGovResults(body: any) {
+  const gov = body?.data?.gov;
+  if (!Array.isArray(gov)) return body;
+  body.data.gov = gov.map(item =>
+    Object.fromEntries(
+      Object.entries(item).map(([key, value]) => [
+        GOV_RESULT_KEYS[key] ?? key,
+        value,
+      ]),
+    ),
+  );
+  return body;
 }
 
 function resultCount(body: any): number {
-  return Array.isArray(body?.results) ? body.results.length : 0;
-}
-
-function firstHeaderValue(req: Request, key: string): string | undefined {
-  const value = req.headers[key];
-  if (Array.isArray(value)) return value[0];
-  return typeof value === "string" ? value : undefined;
-}
-
-function requestOrigin(params: ResearchQueryParams, req: Request) {
-  return params.origin ?? firstHeaderValue(req, "x-origin") ?? "api";
+  if (Array.isArray(body?.results)) return body.results.length;
+  const group = body?.data?.web ?? body?.data?.gov;
+  return Array.isArray(group) ? group.length : 0;
 }
 
 function creditsFor(
@@ -193,8 +346,13 @@ function creditsFor(
   body: any,
   req: RequestWithAuth<any, any, any>,
 ) {
+  // The Research Index and the Government Index are free. Developer/code
+  // search remains billable.
+  if (config.kind === "gov_search" || RESEARCH_INDEX_KINDS.has(config.kind))
+    return 0;
+
   if (config.billAs === "scrape") return 1;
-  const forcedKind = getSearchForcedKind(req.acuc?.flags);
+  const forcedKind = getEffectiveSearchForcedKind(req.acuc?.flags, undefined);
   const perTen =
     forcedKind === "zdr"
       ? ZDR_SEARCH_CREDITS_PER_TEN_RESULTS
@@ -215,30 +373,42 @@ function researchError(
   });
 }
 
-async function fetchResearchUpstream(
+function isResearchTimeoutError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "TimeoutError") ||
+    (error instanceof Error &&
+      (error.name === "ConnectTimeoutError" ||
+        (error.cause instanceof Error &&
+          error.cause.name === "ConnectTimeoutError")))
+  );
+}
+
+async function fetchForRequest(
   req: RequestWithAuth<any, any, any>,
-  path: string,
-  params: Record<string, unknown>,
+  endpoint: ResearchEndpointConfig,
+  params: Record<string, any>,
   queryKeys: string[],
+  zeroDataRetention: boolean,
 ) {
-  const base = config.RESEARCH_PROXY_URL;
-  if (!base) return null;
-
-  const url = new URL(base.replace(/\/+$/, "") + path);
-  appendQuery(url, params, queryKeys);
-
   const headers: Record<string, string> = {};
   for (const h of FORWARDED_REQUEST_HEADERS) {
     const v = req.headers[h];
     if (typeof v === "string") headers[h] = v;
   }
   headers["firecrawl-team-id"] = req.auth.team_id;
+  headers["firecrawl-zero-data-retention"] = String(zeroDataRetention);
+  if (isUsOnly(req.acuc?.flags)) headers["firecrawl-us-only"] = "true";
 
-  return fetch(url, {
-    method: "GET",
+  if ("fetchUpstream" in endpoint) {
+    return endpoint.fetchUpstream(params, headers);
+  }
+
+  return fetchResearchUpstream({
+    path: endpoint.upstreamPath(params, req),
+    params,
+    queryKeys,
     headers,
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-    dispatcher,
+    timeoutMs: endpoint.timeoutMs,
   });
 }
 
@@ -250,6 +420,9 @@ function createResearchController(
 ): ResearchController {
   return async (req, res: Response) => {
     const authedReq = req as RequestWithAuth<any, any, any>;
+    const zeroDataRetention =
+      getEffectiveSearchForcedKind(authedReq.acuc?.flags, undefined) !== null;
+
     const started = Date.now();
     const jobId = uuidv7();
     const logger = rootLogger.child({
@@ -257,11 +430,17 @@ function createResearchController(
       method: endpoint.action,
       jobId,
       teamId: authedReq.auth.team_id,
+      zeroDataRetention,
     });
 
-    const parsed = schema.safeParse(req.query);
+    const source = req.method === "POST" ? (req.body ?? {}) : req.query;
+    const parsed = schema.safeParse(source);
     if (!parsed.success) {
       logger.warn("Invalid research query", { error: parsed.error.issues });
+      // The outer finally below never runs for validation failures, but a
+      // malformed keyless request must still leave the canonical keyless/usage
+      // trail — ID-enumeration abuse produces plenty of 400s.
+      chargeKeylessCredits(authedReq.auth.team_id, 0).catch(() => {});
       return researchError(
         res,
         400,
@@ -276,13 +455,40 @@ function createResearchController(
       id: jobId,
       kind: endpoint.kind,
       api_version: "v2",
+      external_request_id: externalRequestId(authedReq),
       team_id: authedReq.auth.team_id,
       origin: requestOrigin(params, req),
-      integration: params.integration ?? null,
+      integration: resolveIntegration(params.integration, req) ?? null,
       target_hint: targetHint,
-      zeroDataRetention: false,
+      zeroDataRetention,
       api_key_id: authedReq.acuc?.api_key_id ?? null,
     });
+
+    const index: IndexName | null =
+      endpoint.kind === "gov_search"
+        ? "gov"
+        : RESEARCH_INDEX_KINDS.has(endpoint.kind)
+          ? "research"
+          : null;
+    let releaseIndexCall: (() => Promise<void>) | undefined;
+    if (index) {
+      const indexBudget = await reserveIndexCalls(
+        index,
+        authedReq.auth.team_id,
+        authedReq.acuc?.rate_limit_multiplier ?? 1,
+        1,
+      );
+      if (!indexBudget.ok) {
+        chargeKeylessCredits(authedReq.auth.team_id, 0).catch(() => {});
+        res.setHeader("Retry-After", String(indexBudget.retryAfterSeconds));
+        return res.status(429).json({
+          success: false,
+          code: "INDEX_DAILY_LIMIT",
+          ...indexDailyLimitRefusal(index, authedReq.auth.team_id, indexBudget),
+        });
+      }
+      releaseIndexCall = indexBudget.release;
+    }
 
     let statusCode = 500;
     let responseBody: any = null;
@@ -290,13 +496,15 @@ function createResearchController(
     let credits = 0;
 
     try {
-      const upstream = await fetchResearchUpstream(
+      const upstream = await fetchForRequest(
         authedReq,
-        endpoint.upstreamPath(params, authedReq),
+        endpoint,
         params,
         queryKeys,
+        zeroDataRetention,
       );
       if (!upstream) {
+        if (releaseIndexCall) await releaseIndexCall();
         statusCode = 404;
         error = "Research service is not configured";
         return res.status(404).end();
@@ -306,6 +514,20 @@ function createResearchController(
       for (const h of FORWARDED_RESPONSE_HEADERS) {
         const value = upstream.headers.get(h);
         if (value) res.setHeader(h, value);
+      }
+
+      if (isUsOnly(authedReq.acuc?.flags) && upstream.status === 403) {
+        const refusal = await usOnlyUpstreamRefusal(
+          upstream,
+          "This endpoint is not available for teams restricted to US-only processing.",
+        );
+        error = refusal.message;
+        res.setHeader("content-type", "application/json");
+        return res.status(403).json({
+          success: false,
+          code: "US_ONLY_UNAVAILABLE",
+          error: refusal.message,
+        });
       }
 
       const text = await upstream.text();
@@ -320,11 +542,14 @@ function createResearchController(
         if (credits > 0) {
           billTeam(
             authedReq.auth.team_id,
+            authedReq.acuc?.org_id ?? null,
             credits,
             authedReq.acuc?.api_key_id ?? null,
             {
               endpoint: endpoint.billAs === "scrape" ? "scrape" : "search",
               jobId,
+              chargeId: jobId,
+              hostedMcp: authedReq.auth.hostedMcp,
             },
           ).catch(billingError => {
             logger.error("Failed to bill research request", {
@@ -332,7 +557,6 @@ function createResearchController(
               credits,
             });
           });
-          chargeKeylessCredits(authedReq.auth.team_id, credits).catch(() => {});
         }
       } else {
         error =
@@ -341,16 +565,38 @@ function createResearchController(
             : undefined;
       }
 
+      if (
+        endpoint.kind === "gov_search" &&
+        statusCode === 400 &&
+        typeof responseBody?.message === "string"
+      ) {
+        error = responseBody.message;
+        return researchError(res, 400, responseBody.message);
+      }
+
       if (responseBody === null || typeof responseBody === "string") {
         return res.status(statusCode).send(responseBody ?? "");
       }
-      const response =
-        options.legacy && upstream.ok
+      const response = !upstream.ok
+        ? responseBody
+        : options.legacy
           ? addLegacySnakeCaseAliases(responseBody)
-          : responseBody;
+          : endpoint.kind === "gov_search"
+            ? camelCaseGovResults(responseBody)
+            : responseBody;
+      const usOnlyWarning =
+        upstream.ok && isUsOnly(authedReq.acuc?.flags)
+          ? usOnlySkippedWarning(upstream.headers)
+          : undefined;
+      if (usOnlyWarning && !Array.isArray(response)) {
+        response.warning =
+          typeof response.warning === "string" && response.warning.length > 0
+            ? `${response.warning} ${usOnlyWarning}`
+            : usOnlyWarning;
+      }
       return res.status(statusCode).json(response);
     } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === "TimeoutError") {
+      if (isResearchTimeoutError(err)) {
         statusCode = 504;
         error = "Research service timed out";
         return res.status(504).end();
@@ -361,6 +607,18 @@ function createResearchController(
       return res.status(502).end();
     } finally {
       const timeTaken = (Date.now() - started) / 1000;
+
+      // No-op for keyed teams. For keyless callers: billable credits are added
+      // to the per-IP daily budget and land as a `keyless_credit_usage` row;
+      // zero-credit outcomes emit the canonical `keyless/usage` log line
+      // instead (the durable zero-credit row waits on the firecrawl-db
+      // migration). It runs on every outcome, not just billable successes: the
+      // paper endpoints cost 0 credits and ID enumeration mostly produces
+      // upstream misses, so gating this on `credits > 0` left those requests
+      // with no IP recorded anywhere. `credits` is still 0 on every non-2xx
+      // path, so nothing extra is charged.
+      chargeKeylessCredits(authedReq.auth.team_id, credits).catch(() => {});
+
       logResearchEndpoint({
         table: endpoint.table,
         id: jobId,
@@ -374,7 +632,7 @@ function createResearchController(
         credits_cost: statusCode >= 200 && statusCode < 300 ? credits : 0,
         is_successful: statusCode >= 200 && statusCode < 300,
         error,
-        zeroDataRetention: false,
+        zeroDataRetention,
       }).catch(logError => {
         logger.warn("Research endpoint log failed", { error: logError });
       });
@@ -382,17 +640,26 @@ function createResearchController(
   };
 }
 
+function paperId(req: Request) {
+  return (req.params.id as string[]).filter(Boolean).join("/");
+}
+
 export function createResearchRouter(options: { legacy?: boolean } = {}) {
   const router = express.Router();
+  router.use(compression({ threshold: 1024 }));
 
   if (options.legacy) {
     router.use((req, _res, next) => {
+      const authedReq = req as RequestWithAuth<any, any, any>;
       rootLogger.warn("Legacy research endpoint used", {
         module: "api/v2/research",
-        teamId: (req as RequestWithAuth<any, any, any>).auth?.team_id,
+        teamId: authedReq.auth?.team_id,
         method: req.method,
         path: req.originalUrl,
         requestId: req.headers["x-request-id"],
+        zeroDataRetention:
+          getEffectiveSearchForcedKind(authedReq.acuc?.flags, undefined) !==
+          null,
       });
       next();
     });
@@ -403,13 +670,14 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
     wrap(
       createResearchController(
         searchPapersSchema,
-        ["query", "k", "authors", "categories", "from", "to"],
+        ["query", "k", "authors", "categories", "from", "to", "sort"],
         {
           kind: "research_paper_search",
           table: "research_paper_searches",
           action: "searchPapers",
           targetHint: params => String(params.query),
           upstreamPath: () => "/v2/research/papers",
+          timeoutMs: PAPER_SEARCH_TIMEOUT_MS,
           billAs: "search",
         },
         options,
@@ -418,7 +686,7 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
   );
 
   router.get(
-    "/papers/:id/similar",
+    "/papers/*id/similar",
     wrap(
       createResearchController(
         similarPapersSchema,
@@ -428,9 +696,10 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
           table: "research_related_papers",
           action: "similarPapers",
           targetHint: (params, req) =>
-            `${req.params.id}: ${String(params.intent)}`,
+            `${paperId(req)}: ${String(params.intent)}`,
           upstreamPath: (_params, req) =>
-            `/v2/research/papers/${encodeURIComponent(req.params.id)}/similar`,
+            `/v2/research/papers/${encodeURIComponent(paperId(req))}/similar`,
+          timeoutMs: SIMILAR_PAPERS_TIMEOUT_MS,
           billAs: "search",
         },
         options,
@@ -439,7 +708,7 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
   );
 
   router.get(
-    "/papers/:id",
+    "/papers/*id",
     wrap(async (req: Request, res: Response) => {
       const authedReq = req as RequestWithAuth<any, any, any>;
       const parsed = paperSchema.safeParse(req.query);
@@ -451,9 +720,10 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
           kind: isRead ? "research_paper_read" : "research_paper_inspect",
           table: isRead ? "research_paper_reads" : "research_paper_inspects",
           action: isRead ? "readPaper" : "inspectPaper",
-          targetHint: (_params, request) => request.params.id,
+          targetHint: (_params, request) => paperId(request),
           upstreamPath: (_params, request) =>
-            `/v2/research/papers/${encodeURIComponent(request.params.id)}`,
+            `/v2/research/papers/${encodeURIComponent(paperId(request))}`,
+          timeoutMs: isRead ? PAPER_READ_TIMEOUT_MS : PAPER_INSPECT_TIMEOUT_MS,
           billAs: "scrape",
         },
         options,
@@ -462,24 +732,85 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
     }),
   );
 
-  router.get(
-    "/github",
-    wrap(
-      createResearchController(
-        githubSearchSchema,
-        ["query", "k"],
-        {
-          kind: "research_github_search",
-          table: "research_github_searches",
-          action: "searchGithub",
-          targetHint: params => String(params.query),
-          upstreamPath: () => "/v2/research/github",
-          billAs: "search",
-        },
-        options,
+  if (!options.legacy) {
+    router.get(
+      "/proteins",
+      wrap(
+        createResearchController(proteinLookupSchema, ["protein", "organism"], {
+          kind: "research_paper_inspect",
+          table: "research_paper_inspects",
+          action: "lookupProtein",
+          targetHint: params => `protein:${params.protein}`,
+          upstreamPath: () => "/v2/research/proteins",
+          timeoutMs: PROTEIN_LOOKUP_TIMEOUT_MS,
+          billAs: "scrape",
+        }),
       ),
+    );
+  }
+
+  return router;
+}
+
+export function createDeveloperRouter(options: { root?: boolean } = {}) {
+  const router = express.Router();
+
+  const controller = wrap(
+    createResearchController(
+      developerSearchSchema,
+      DEVELOPER_SEARCH_QUERY_KEYS,
+      {
+        kind: "code_search",
+        table: "code_searches",
+        action: "searchDeveloper",
+        targetHint: params => String(params.query),
+        upstreamPath: () => "/v2/code/search",
+        timeoutMs: DEVELOPER_SEARCH_TIMEOUT_MS,
+        billAs: "search",
+      },
     ),
   );
+
+  const gate = searchCreditGate();
+  if (options.root) {
+    router.get("/", gate, controller);
+    router.post("/", gate, controller);
+  } else {
+    router.get("/search", gate, controller);
+    router.post("/search", gate, controller);
+  }
+
+  return router;
+}
+
+export function createGovRouter() {
+  const router = express.Router();
+
+  const controller = wrap(
+    createResearchController(govSearchSchema, [], {
+      kind: "gov_search",
+      table: "gov_searches",
+      action: "searchGov",
+      targetHint: params => String(params.query),
+      billAs: "search",
+      fetchUpstream: (params, headers) =>
+        fetchGovUpstream({
+          query: params.query,
+          k: params.k,
+          jurisdiction: params.jurisdiction,
+          court: params.court,
+          courtType: params.courtType,
+          cites: params.cites,
+          domain: params.domain,
+          sources: params.sources,
+          headers,
+          timeoutMs: GOV_SEARCH_TIMEOUT_MS,
+        }),
+    }),
+  );
+
+  router.get("/", controller);
+  router.post("/", controller);
 
   return router;
 }

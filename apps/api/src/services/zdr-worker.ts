@@ -1,8 +1,10 @@
 import "dotenv/config";
-import "./sentry";
-import { setSentryServiceTag } from "./sentry";
+import { shutdownTracing } from "../otel";
 import { logger } from "../lib/logger";
-import { zdrcleaner } from "../lib/zdrcleaner";
+import { cleanZdrJob, sendZdrHeartbeat } from "../lib/zdrcleaner";
+import { consumeZdrCleanupJobs, shutdownZdrQueue } from "../lib/zdr-queue";
+import { startRole } from "../main";
+import { runProcessStop } from "../service/service";
 
 let isShuttingDown = false;
 
@@ -16,13 +18,26 @@ process.on("SIGTERM", () => {
   isShuttingDown = true;
 });
 
-(async () => {
-  setSentryServiceTag("zdr-worker");
+export async function start() {
+  await consumeZdrCleanupJobs(cleanZdrJob);
 
+  // Cleanup is driven entirely by the delayed RabbitMQ queue; this loop only
+  // keeps the liveness heartbeat going while the consumer runs.
   while (!isShuttingDown) {
-    await zdrcleaner();
+    await sendZdrHeartbeat();
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
 
+  try {
+    await shutdownZdrQueue();
+  } finally {
+    await runProcessStop("zdr-worker");
+  }
+  await shutdownTracing();
   logger.info("zdr-worker exiting");
   process.exit(0);
-})();
+}
+
+if (require.main === module) {
+  void startRole("zdr-worker");
+}

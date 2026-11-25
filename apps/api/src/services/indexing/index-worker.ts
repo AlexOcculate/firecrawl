@@ -1,8 +1,6 @@
 import "dotenv/config";
 import { config } from "../../config";
-import "../sentry";
-import { setSentryServiceTag } from "../sentry";
-import * as Sentry from "@sentry/node";
+import { shutdownTracing } from "../../otel";
 import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger, logger } from "../../lib/logger";
 import {
@@ -19,16 +17,13 @@ import {
 import { resolveBillingMetadata } from "../billing/types";
 import systemMonitor from "../system-monitor";
 import { v7 as uuidv7 } from "uuid";
-import {
-  processIndexInsertJobs,
-  processOMCEJobs,
-  queryDomainsForPrecrawl,
-} from "..";
+import { processIndexInsertJobs, queryDomainsForPrecrawl } from "..";
 import { queryTopUrlsForDomain } from "../../db/rpc";
 import { getSearchIndexClient } from "../../lib/search-index-client";
 // Search indexing is now handled by the separate search service
 // import { processSearchIndexJobs } from "../../lib/search-index/queue";
 import { processWebhookInsertJobs } from "../webhook";
+import { reconcileBrowserSessions } from "../../lib/browser-lifecycle";
 import { processBrowserSessionActivityJobs } from "../../lib/browser-session-activity";
 import {
   scrapeOptions as scrapeOptionsSchema,
@@ -36,15 +31,21 @@ import {
   toV0CrawlerOptions,
 } from "../../controllers/v2/types";
 import { StoredCrawl, crawlToCrawler, saveCrawl } from "../../lib/crawl-redis";
+import { requestContext } from "../../lib/request-context";
 import { _addScrapeJobToBullMQ } from "../queue-jobs";
 import { withSpan, setSpanAttributes } from "../../lib/otel-tracer";
 import { crawlGroup, resolveNewGroupBackend } from "../worker/nuq-router";
 import { getACUCTeam } from "../../controllers/auth";
-import { processEngpickerJob } from "../../lib/engpicker";
-import { logRequest } from "../logging/log_job";
+import { logRequest, shutdownPubSubLogging } from "../logging/log_job";
+import { startSiemLoggingConsumer } from "../siem-logging/worker";
+import { closeSiemLoggingTransport } from "../../lib/siem-logging/transport";
+import { requestCreditsShards } from "../../lib/request-credits-store";
+import { startRole } from "../../main";
+import { runProcessStop } from "../../service/service";
+import { indexWorkerEnv } from "./index-worker-env";
 
-const workerLockDuration = config.WORKER_LOCK_DURATION;
-const workerStalledCheckInterval = config.WORKER_STALLED_CHECK_INTERVAL;
+const workerLockDuration = indexWorkerEnv.WORKER_LOCK_DURATION;
+const workerStalledCheckInterval = indexWorkerEnv.WORKER_STALLED_CHECK_INTERVAL;
 const jobLockExtendInterval = config.JOB_LOCK_EXTEND_INTERVAL;
 const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 
@@ -82,6 +83,9 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // This is an individual billing operation that should be queued for batch processing
       const {
         team_id,
+        // Undefined on a job enqueued before the producer carried the org;
+        // passed through as such so the batch resolves it once instead.
+        org_id,
         credits,
         billing,
         endpoint,
@@ -100,6 +104,7 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // Add to the REDIS batch queue
       await queueBillingOperation(
         team_id,
+        org_id,
         credits,
         api_key_id ?? null,
         resolveBillingMetadata({
@@ -123,7 +128,6 @@ const processBillingJobInternal = async (token: string, job: Job) => {
     await job.moveToCompleted({ success: true }, token, false);
   } catch (error) {
     logger.error("Error processing billing job", { error });
-    Sentry.captureException(error);
     err = error;
     await job.moveToFailed(error, token, false);
   } finally {
@@ -165,7 +169,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
   const MIN_URLS_PER_DOMAIN = 10;
   const MAX_URLS_PER_DOMAIN = 50;
 
-  const teamId = config.PRECRAWL_TEAM_ID;
+  const teamId = indexWorkerEnv.PRECRAWL_TEAM_ID;
 
   try {
     await withSpan("precrawl.job", async span => {
@@ -482,6 +486,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               target_hint: url,
               zeroDataRetention: false,
               api_key_id: null,
+              creditsShards: requestCreditsShards(limit),
             });
 
             const crawlerOptions = {
@@ -496,7 +501,14 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               storeInCache: true,
               onlyMainContent: false,
             });
+            const ctx = requestContext({
+              teamId,
+              zeroDataRetention: false,
+              orgId: null,
+              apiKeyId: null,
+            });
             const sc: StoredCrawl = {
+              ctx,
               originUrl: url,
               crawlerOptions: toV0CrawlerOptions(crawlerOptions),
               scrapeOptions,
@@ -535,6 +547,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               {
                 url: url,
                 mode: "kickoff" as const,
+                ctx,
                 team_id: teamId,
                 crawlerOptions,
                 scrapeOptions: sc.scrapeOptions,
@@ -553,7 +566,6 @@ const processPrecrawlJob = async (token: string, job: Job) => {
             submittedCrawls++;
           } catch (e) {
             logger.error("Error adding precrawl job to queue", { error: e });
-            Sentry.captureException(e);
           }
         }
 
@@ -578,7 +590,6 @@ const processPrecrawlJob = async (token: string, job: Job) => {
     });
   } catch (e) {
     logger.error("Error processing precrawl job", { error: e });
-    Sentry.captureException(e);
     await job.moveToFailed(e, token, false);
   } finally {
     clearInterval(extendLockInterval);
@@ -587,15 +598,13 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
 let isShuttingDown = false;
 
-if (require.main === module) {
-  process.on("SIGINT", () => {
-    logger.info("Received SIGINT. Shutting down gracefully...");
-    isShuttingDown = true;
-  });
-
-  process.on("SIGTERM", () => {
-    logger.info("Received SIGTERM. Shutting down gracefully...");
-    isShuttingDown = true;
+// The SIEM consumer is a subscription rather than a loop, so it has to be torn
+// down from the signal path: workerFun exits the process once its own jobs
+// drain, so anything after the worker Promise.all never runs. Unacked batches go
+// back to the broker for another replica.
+function shutdownSiemLoggingTransport(): void {
+  closeSiemLoggingTransport().catch(error => {
+    logger.warn("Failed to close the SIEM logging transport", { error });
   });
 }
 
@@ -672,19 +681,37 @@ const workerFun = async (
     await new Promise(resolve => setTimeout(resolve, 500));
   }
   logger.info("All jobs finished. Worker exiting!");
+  try {
+    await shutdownPubSubLogging();
+  } finally {
+    await runProcessStop("index-worker");
+  }
+  await shutdownTracing();
   process.exit(0);
 };
 
 const INDEX_INSERT_INTERVAL = 3000;
+const INDEX_INSERT_MAX_IN_FLIGHT_MS = 5 * 60 * 1000;
 const WEBHOOK_INSERT_INTERVAL = 15000;
-const OMCE_INSERT_INTERVAL = 5000;
+// OMCE job inserts are disabled to reduce index DB load.
+// const OMCE_INSERT_INTERVAL = 5000;
 const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
 // Search indexing is now handled by separate search service, not this worker
 // const SEARCH_INDEX_INTERVAL = 10000;
 
 // Start the workers
-(async () => {
-  setSentryServiceTag("index-worker");
+export async function start() {
+  process.on("SIGINT", () => {
+    logger.info("Received SIGINT. Shutting down gracefully...");
+    isShuttingDown = true;
+    shutdownSiemLoggingTransport();
+  });
+
+  process.on("SIGTERM", () => {
+    logger.info("Received SIGTERM. Shutting down gracefully...");
+    isShuttingDown = true;
+    shutdownSiemLoggingTransport();
+  });
 
   // Start billing worker and batch processing
   startBillingBatchProcessing();
@@ -693,24 +720,52 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
     processBillingJobInternal,
   );
 
-  const precrawlWorkerPromise = config.PRECRAWL_TEAM_ID
+  const precrawlWorkerPromise = indexWorkerEnv.PRECRAWL_TEAM_ID
     ? workerFun(getPrecrawlQueue(), processPrecrawlJob)
     : (async () => {
         logger.warn("PRECRAWL_TEAM_ID not set, skipping precrawl worker");
       })();
+  // A RabbitMQ consumer registration, not a polling loop: it returns once
+  // subscribed and the transport reconnects itself on a broker drop.
+  startSiemLoggingConsumer().catch(error => {
+    logger.error("Failed to start the SIEM logging consumer", { error });
+  });
 
+  let indexInsertStartedAt: number | null = null;
   const indexInserterInterval = setInterval(async () => {
     if (isShuttingDown) {
       return;
     }
 
-    await withSpan("firecrawl-index-worker-process-insert-jobs", async span => {
-      setSpanAttributes(span, {
-        "index.worker.operation": "process_insert_jobs",
-        "index.worker.type": "scheduled",
+    // Skip the tick while the previous insert is still running, unless it looks stuck.
+    if (indexInsertStartedAt !== null) {
+      const inFlightMs = Date.now() - indexInsertStartedAt;
+      if (inFlightMs < INDEX_INSERT_MAX_IN_FLIGHT_MS) {
+        return;
+      }
+      logger.warn("Previous index insert run is stuck, starting a new one", {
+        inFlightMs,
       });
-      await processIndexInsertJobs();
-    });
+    }
+
+    const startedAt = Date.now();
+    indexInsertStartedAt = startedAt;
+    try {
+      await withSpan(
+        "firecrawl-index-worker-process-insert-jobs",
+        async span => {
+          setSpanAttributes(span, {
+            "index.worker.operation": "process_insert_jobs",
+            "index.worker.type": "scheduled",
+          });
+          await processIndexInsertJobs();
+        },
+      );
+    } finally {
+      if (indexInsertStartedAt === startedAt) {
+        indexInsertStartedAt = null;
+      }
+    }
   }, INDEX_INSERT_INTERVAL);
 
   const webhookInserterInterval = setInterval(async () => {
@@ -720,39 +775,28 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
     await processWebhookInsertJobs();
   }, WEBHOOK_INSERT_INTERVAL);
 
+  const browserReconcileInterval = setInterval(() => {
+    if (!isShuttingDown) void reconcileBrowserSessions();
+  }, 15_000);
+
   const browserActivityInterval = setInterval(async () => {
     if (isShuttingDown) return;
     await processBrowserSessionActivityJobs();
   }, BROWSER_ACTIVITY_INSERT_INTERVAL);
 
-  const omceInserterInterval = setInterval(async () => {
-    if (isShuttingDown) {
-      return;
-    }
-    await withSpan("firecrawl-index-worker-process-omce-jobs", async span => {
-      setSpanAttributes(span, {
-        "index.worker.operation": "process_omce_jobs",
-        "index.worker.type": "scheduled",
-      });
-      await processOMCEJobs();
-    });
-  }, OMCE_INSERT_INTERVAL);
-
-  const engpickerPromise = (async () => {
-    if (config.DISABLE_ENGPICKER) {
-      logger.info("Engpicker is disabled, skipping");
-      return;
-    }
-
-    while (!isShuttingDown) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      try {
-        await processEngpickerJob();
-      } catch (e) {
-        logger.error("Error processing engpicker job", { error: e });
-      }
-    }
-  })();
+  // OMCE job inserts are disabled to reduce index DB load.
+  // const omceInserterInterval = setInterval(async () => {
+  //   if (isShuttingDown) {
+  //     return;
+  //   }
+  //   await withSpan("firecrawl-index-worker-process-omce-jobs", async span => {
+  //     setSpanAttributes(span, {
+  //       "index.worker.operation": "process_omce_jobs",
+  //       "index.worker.type": "scheduled",
+  //     });
+  //     await processOMCEJobs();
+  //   });
+  // }, OMCE_INSERT_INTERVAL);
 
   // Search indexing is now handled by separate search service
   // The search service has its own worker that processes the queue
@@ -776,15 +820,16 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
   }
 
   // Wait for all workers to complete (which should only happen on shutdown)
-  await Promise.all([
-    billingWorkerPromise,
-    precrawlWorkerPromise,
-    engpickerPromise,
-  ]);
+  await Promise.all([billingWorkerPromise, precrawlWorkerPromise]);
 
   clearInterval(indexInserterInterval);
   clearInterval(webhookInserterInterval);
   clearInterval(browserActivityInterval);
-  clearInterval(omceInserterInterval);
+  clearInterval(browserReconcileInterval);
+  // clearInterval(omceInserterInterval);
   logger.info("All workers shut down, exiting process");
-})();
+}
+
+if (require.main === module) {
+  void startRole("index-worker");
+}

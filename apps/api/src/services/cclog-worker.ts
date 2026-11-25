@@ -1,7 +1,5 @@
 import "dotenv/config";
-import { config } from "../config";
-import "./sentry";
-import { setSentryServiceTag } from "./sentry";
+import { shutdownTracing } from "../otel";
 import Express from "express";
 import { logger as _logger } from "../lib/logger";
 import {
@@ -10,15 +8,41 @@ import {
   runCclogTick,
 } from "../lib/cclog";
 import { getRedisConnection } from "./queue-service";
+import { startRole } from "../main";
+import { runProcessStop } from "../service/service";
+import { cclogWorkerEnv } from "./cclog-worker-env";
 
 const CCLOG_WORKER_LOCK_KEY = "cclog:worker:tick-lock";
 const CCLOG_WORKER_LOCK_TTL_SECONDS = 55;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-(async () => {
-  setSentryServiceTag("cclog-worker");
+async function sleepUntilNextMinute() {
+  const now = new Date();
+  const nextMinute = now.getTime() + getMsUntilNextMinute(now);
+  while (Date.now() < nextMinute) {
+    await sleep(nextMinute - Date.now());
+  }
+}
 
+async function sendHeartbeat() {
+  if (cclogWorkerEnv.CCLOG_WORKER_HEARTBEAT_URL) {
+    try {
+      const response = await fetch(cclogWorkerEnv.CCLOG_WORKER_HEARTBEAT_URL, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        _logger.warn("cclog heartbeat got non-OK response", {
+          status: response.status,
+        });
+      }
+    } catch (error) {
+      _logger.warn("Failed to send cclog heartbeat", { error });
+    }
+  }
+}
+
+export async function start() {
   let isShuttingDown = false;
   let tickInFlight = false;
 
@@ -27,19 +51,22 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
     res.status(200).send("OK");
   });
 
-  const server = app.listen(config.CCLOG_WORKER_PORT, (error?: Error) => {
-    if (error) {
-      _logger.error("Failed to start cclog worker", {
-        error,
-        port: config.CCLOG_WORKER_PORT,
-      });
-      throw error;
-    }
+  const server = app.listen(
+    cclogWorkerEnv.CCLOG_WORKER_PORT,
+    (error?: Error) => {
+      if (error) {
+        _logger.error("Failed to start cclog worker", {
+          error,
+          port: cclogWorkerEnv.CCLOG_WORKER_PORT,
+        });
+        throw error;
+      }
 
-    _logger.info("cclog worker started", {
-      port: config.CCLOG_WORKER_PORT,
-    });
-  });
+      _logger.info("cclog worker started", {
+        port: cclogWorkerEnv.CCLOG_WORKER_PORT,
+      });
+    },
+  );
 
   async function shutdown() {
     if (isShuttingDown) return;
@@ -51,21 +78,21 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
       await sleep(1000);
     }
 
-    server.close(() => {
+    server.close(async () => {
+      await runProcessStop("cclog-worker");
+      await shutdownTracing();
       _logger.info("cclog worker shut down");
       process.exit(0);
     });
   }
 
-  if (require.main === module) {
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
-  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   _logger.info("Waiting for next exact minute to start cclog worker", {
     waitMs: getMsUntilNextMinute(),
   });
-  await sleep(getMsUntilNextMinute());
+  await sleepUntilNextMinute();
 
   const redis = getRedisConnection();
 
@@ -88,6 +115,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
           at: at.toISOString(),
           ...summary,
         });
+        await sendHeartbeat();
       } else {
         _logger.info("Skipping cclog tick because another worker holds lock", {
           at: at.toISOString(),
@@ -100,7 +128,11 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
     }
 
     if (!isShuttingDown) {
-      await sleep(getMsUntilNextMinute());
+      await sleepUntilNextMinute();
     }
   }
-})();
+}
+
+if (require.main === module) {
+  void startRole("cclog-worker");
+}

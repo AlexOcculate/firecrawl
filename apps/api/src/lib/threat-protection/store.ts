@@ -1,9 +1,12 @@
+import { createHash } from "crypto";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { db, dbRr } from "../../db/connection";
 import * as schema from "../../db/schema";
 import { deleteKey, getValue, setValue } from "../../services/redis";
 import { logger as _logger } from "../logger";
+import { decryptOrgSecret, encryptOrgSecret } from "../org-secret-crypto";
+import type { ZscalerCredentials } from "./providers/zscaler/client";
 import {
   THREAT_PROTECTION_POLICY_DEFAULTS,
   type ThreatProtectionPolicy,
@@ -23,6 +26,61 @@ const CACHE_TTL_SECONDS = 60;
 
 const cacheKey = (orgId: string) => `threat-protection-config:${orgId}`;
 
+// Bounded per-pod LRU cache of parsed org configs, keyed by orgId and
+// validated against the SHA-256 digest of the Redis JSON string on every read.
+// Avoids re-parsing large domain lists on every request, drops the raw string
+// so memory is not doubled, and keeps frozen array references stable so
+// verdict.ts's WeakMap index is reused across requests with zero staleness.
+const MAX_PARSED_CONFIG_CACHE_ENTRIES = 100;
+const MAX_PARSED_CONFIG_CACHE_BYTES = 16 * 1024 * 1024;
+const parsedConfigCache = new Map<
+  string,
+  { hash: string; bytes: number; config: OrgThreatProtectionConfig | null }
+>();
+let parsedConfigCacheBytes = 0;
+
+function hashSerializedConfig(raw: string): string {
+  return createHash("sha256").update(raw).digest("base64");
+}
+
+function freezePolicyLists(
+  config: OrgThreatProtectionConfig | null,
+): OrgThreatProtectionConfig | null {
+  if (!config) return null;
+  Object.freeze(config.policy.blacklist);
+  Object.freeze(config.policy.whitelist);
+  Object.freeze(config.policy.blockedTlds);
+  return config;
+}
+
+function deleteParsedConfigCache(orgId: string): void {
+  const existing = parsedConfigCache.get(orgId);
+  if (existing) {
+    parsedConfigCacheBytes -= existing.bytes;
+    parsedConfigCache.delete(orgId);
+  }
+}
+
+function setParsedConfigCache(
+  orgId: string,
+  hash: string,
+  bytes: number,
+  config: OrgThreatProtectionConfig | null,
+): void {
+  deleteParsedConfigCache(orgId);
+  if (bytes > MAX_PARSED_CONFIG_CACHE_BYTES) return;
+  while (
+    parsedConfigCache.size >= MAX_PARSED_CONFIG_CACHE_ENTRIES ||
+    parsedConfigCacheBytes + bytes > MAX_PARSED_CONFIG_CACHE_BYTES
+  ) {
+    const oldestKey = parsedConfigCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    deleteParsedConfigCache(oldestKey);
+  }
+  parsedConfigCache.set(orgId, { hash, bytes, config });
+  parsedConfigCacheBytes += bytes;
+}
+
 /**
  * Whether an error is Postgres 42P01 (undefined_table) for our config table.
  * During the rollout window the enforcement code can be deployed before the
@@ -41,10 +99,26 @@ function isMissingTableError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * Stored (non-secret-decrypted) Zscaler settings. `secretCiphertext` is the
+ * AES-256-GCM output of the write-only client secret — decrypted only by
+ * {@link getOrgZscalerCredentials} at call time, never serialized to the API
+ * or into job payloads.
+ */
+interface OrgZscalerSettings {
+  clientId: string;
+  secretCiphertext: string;
+  vanityDomain: string;
+  cloud: string | null;
+  deniedCategories: string[];
+  syncIntervalMinutes: number;
+}
+
 export interface OrgThreatProtectionConfig {
   orgId: string;
   policy: ThreatProtectionPolicy;
   allowRequestOverrides: boolean;
+  zscaler: OrgZscalerSettings | null;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -60,6 +134,20 @@ type ThreatProtectionConfigRow =
  * field defaults instead of throwing — a bad row must never take down the
  * enforcement hot path.
  */
+const storedZscalerSchema = z
+  .object({
+    clientId: z.string().min(1),
+    secretCiphertext: z.string().min(1),
+    vanityDomain: z.string().min(1),
+    cloud: z.string().nullable().catch(null),
+    deniedCategories: z.array(z.string()).catch([]),
+    syncIntervalMinutes: z.number().int().positive().catch(60),
+  })
+  // A malformed block degrades to "no Zscaler connection" (lookups then fail
+  // per the org's failurePolicy) instead of throwing on the hot path.
+  .nullable()
+  .catch(null);
+
 const storedConfigDocumentSchema = z
   .object({
     riskScoreThreshold: z
@@ -75,10 +163,12 @@ const storedConfigDocumentSchema = z
       .enum(["open", "closed"])
       .catch(THREAT_PROTECTION_POLICY_DEFAULTS.failurePolicy),
     allowRequestOverrides: z.boolean().catch(true),
+    zscaler: storedZscalerSchema.optional().catch(null),
   })
   .catch({
     ...THREAT_PROTECTION_POLICY_DEFAULTS,
     allowRequestOverrides: true,
+    zscaler: null,
   });
 
 /**
@@ -91,20 +181,38 @@ export function rowToConfig(
   row: ThreatProtectionConfigRow,
 ): OrgThreatProtectionConfig {
   const doc = storedConfigDocumentSchema.parse(row.config ?? {});
-  return {
+  const zscaler = doc.zscaler ?? null;
+  return freezePolicyLists({
     orgId: row.org_id,
     policy: {
-      mode: row.mode === "normal" ? "normal" : "off",
+      mode:
+        row.mode === "normal"
+          ? "normal"
+          : row.mode === "zscaler"
+            ? "zscaler"
+            : row.mode === "manual-only"
+              ? "manual-only"
+              : "off",
       riskScoreThreshold: doc.riskScoreThreshold,
       blacklist: doc.blacklist,
       whitelist: doc.whitelist,
       blockedTlds: doc.blockedTlds,
       failurePolicy: doc.failurePolicy,
+      ...(zscaler
+        ? {
+            zscaler: {
+              orgId: row.org_id,
+              deniedCategories: zscaler.deniedCategories,
+              syncIntervalMinutes: zscaler.syncIntervalMinutes,
+            },
+          }
+        : {}),
     },
     allowRequestOverrides: doc.allowRequestOverrides,
+    zscaler,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-  };
+  })!;
 }
 
 /**
@@ -121,7 +229,19 @@ export async function getOrgThreatProtectionConfig(
   try {
     const cached = await getValue(key);
     if (cached !== null) {
-      return JSON.parse(cached) as OrgThreatProtectionConfig | null;
+      const hash = hashSerializedConfig(cached);
+      const mem = parsedConfigCache.get(orgId);
+      if (mem && mem.hash === hash) {
+        // Refresh LRU recency.
+        parsedConfigCache.delete(orgId);
+        parsedConfigCache.set(orgId, mem);
+        return mem.config;
+      }
+      const parsed = freezePolicyLists(
+        JSON.parse(cached) as OrgThreatProtectionConfig | null,
+      );
+      setParsedConfigCache(orgId, hash, Buffer.byteLength(cached), parsed);
+      return parsed;
     }
   } catch (error) {
     logger.warn("Failed to read threat protection config cache", {
@@ -150,9 +270,16 @@ export async function getOrgThreatProtectionConfig(
   }
 
   const config = rows[0] ? rowToConfig(rows[0]) : null;
+  const serialized = JSON.stringify(config);
+  setParsedConfigCache(
+    orgId,
+    hashSerializedConfig(serialized),
+    Buffer.byteLength(serialized),
+    config,
+  );
 
   try {
-    await setValue(key, JSON.stringify(config), CACHE_TTL_SECONDS);
+    await setValue(key, serialized, CACHE_TTL_SECONDS);
   } catch (error) {
     logger.warn("Failed to write threat protection config cache", {
       error,
@@ -164,13 +291,63 @@ export async function getOrgThreatProtectionConfig(
 }
 
 /**
+ * The PUT config document needs a client secret we do not have: thrown when a
+ * Zscaler block is first configured without one, or when the client ID
+ * changes without a matching new secret. Mapped to a 400 by the controller.
+ */
+export class ZscalerSecretRequiredError extends Error {
+  constructor() {
+    super(
+      "zscaler.clientSecret is required when configuring a Zscaler connection or changing its client ID",
+    );
+    this.name = "ZscalerSecretRequiredError";
+  }
+}
+
+/**
  * Full-document upsert of the org's threat protection config. Invalidates
  * the read cache on success.
+ *
+ * The Zscaler client secret is write-only: when the input block omits it,
+ * the stored ciphertext is kept — but only while the client ID is unchanged
+ * (pairing a new client with an old secret is always a mistake, so that
+ * throws {@link ZscalerSecretRequiredError} instead).
  */
 export async function upsertOrgThreatProtectionConfig(
   orgId: string,
   config: ThreatProtectionConfigInput,
 ): Promise<OrgThreatProtectionConfig> {
+  let zscaler: z.infer<typeof storedZscalerSchema> = null;
+  if (config.zscaler) {
+    let secretCiphertext: string;
+    if (config.zscaler.clientSecret) {
+      secretCiphertext = encryptOrgSecret(config.zscaler.clientSecret, orgId);
+    } else {
+      // Primary read: the upsert below writes to the primary, and a stale
+      // replica must not make us discard a just-saved secret.
+      const existingRows = await db
+        .select({ config: schema.threat_protection_config.config })
+        .from(schema.threat_protection_config)
+        .where(eq(schema.threat_protection_config.org_id, orgId))
+        .limit(1);
+      const existing = existingRows[0]
+        ? storedConfigDocumentSchema.parse(existingRows[0].config ?? {}).zscaler
+        : null;
+      if (!existing || existing.clientId !== config.zscaler.clientId) {
+        throw new ZscalerSecretRequiredError();
+      }
+      secretCiphertext = existing.secretCiphertext;
+    }
+    zscaler = {
+      clientId: config.zscaler.clientId,
+      secretCiphertext,
+      vanityDomain: config.zscaler.vanityDomain,
+      cloud: config.zscaler.cloud,
+      deniedCategories: config.zscaler.deniedCategories,
+      syncIntervalMinutes: config.zscaler.syncIntervalMinutes,
+    };
+  }
+
   const values = {
     org_id: orgId,
     mode: config.mode,
@@ -182,6 +359,7 @@ export async function upsertOrgThreatProtectionConfig(
       blockedTlds: config.blockedTlds,
       failurePolicy: config.failurePolicy,
       allowRequestOverrides: config.allowRequestOverrides,
+      zscaler,
     },
   };
 
@@ -196,6 +374,8 @@ export async function upsertOrgThreatProtectionConfig(
       },
     })
     .returning();
+
+  deleteParsedConfigCache(orgId);
 
   try {
     await deleteKey(cacheKey(orgId));
@@ -233,7 +413,9 @@ export async function getOrgIdForTeam(teamId: string): Promise<string | null> {
  */
 export function resolveEffectivePolicy(
   orgConfig: OrgThreatProtectionConfig | null,
-  requestOverride?: Partial<ThreatProtectionPolicy>,
+  // Omit is deliberate: the Zscaler connection is org-owned and never
+  // request-settable — passing one is a compile error, not an ignored field.
+  requestOverride?: Partial<Omit<ThreatProtectionPolicy, "zscaler">>,
 ): ThreatProtectionPolicy {
   const base: ThreatProtectionPolicy = orgConfig
     ? { ...orgConfig.policy }
@@ -246,6 +428,10 @@ export function resolveEffectivePolicy(
   for (const key of Object.keys(requestOverride) as Array<
     keyof ThreatProtectionPolicy
   >) {
+    // The Zscaler connection settings come from the org config only — the
+    // override schema has no such field, and this guard keeps it that way
+    // even if a wider Partial ever reaches here.
+    if (key === "zscaler") continue;
     const value = requestOverride[key];
     if (value !== undefined) {
       (base as unknown as Record<string, unknown>)[key] = value;
@@ -253,4 +439,31 @@ export function resolveEffectivePolicy(
   }
 
   return base;
+}
+
+/**
+ * Decrypted Zscaler API credentials for an org, or null when the org has no
+ * (valid) Zscaler connection. Backed by the 60s org-config cache, so a saved
+ * secret rotation is picked up within a minute — the plaintext itself lives
+ * only in this return value, never in a cache or a job payload.
+ */
+export async function getOrgZscalerCredentials(
+  orgId: string,
+): Promise<ZscalerCredentials | null> {
+  const orgConfig = await getOrgThreatProtectionConfig(orgId);
+  if (!orgConfig?.zscaler) return null;
+  try {
+    return {
+      clientId: orgConfig.zscaler.clientId,
+      clientSecret: decryptOrgSecret(orgConfig.zscaler.secretCiphertext, orgId),
+      vanityDomain: orgConfig.zscaler.vanityDomain,
+      cloud: orgConfig.zscaler.cloud,
+    };
+  } catch (error) {
+    logger.error("Failed to decrypt the stored Zscaler client secret", {
+      error,
+      orgId,
+    });
+    return null;
+  }
 }

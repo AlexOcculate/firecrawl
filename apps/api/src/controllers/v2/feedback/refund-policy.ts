@@ -1,9 +1,11 @@
-import { config } from "../../../config";
+import { feedbackEnv } from "../../../lib/feedback-env";
 import {
   FeedbackJobRow,
   FeedbackRating,
   RefundPolicySnapshot,
+  isSessionEndpoint,
 } from "./internal-types";
+import type { RefundClass } from "../../../lib/feedback-job-store";
 
 type RefundablePolicy =
   | {
@@ -52,7 +54,7 @@ function none(
     desiredRefund: 0,
     policy: {
       version: "feedback_refund_v1",
-      enabled: config.FEEDBACK_REFUND_ENABLED,
+      enabled: feedbackEnv.FEEDBACK_REFUND_ENABLED,
       endpoint: job.endpoint,
       mode: "none",
       refundableRatings,
@@ -61,8 +63,8 @@ function none(
   };
 }
 
-function policyFor(job: FeedbackJobRow): RefundablePolicy {
-  switch (job.endpoint) {
+function policyForRefundClass(refundClass: RefundClass): RefundablePolicy {
+  switch (refundClass) {
     case "search":
       return {
         mode: "flat",
@@ -85,33 +87,27 @@ function policyFor(job: FeedbackJobRow): RefundablePolicy {
         percent: 0.25,
         maxCredits: 10,
       };
-    case "scrape":
-      if (optionListIncludes(job.options, "parsers", "pdf")) {
-        return {
-          mode: "percentage_with_cap",
-          reason: "scrape_pdf_feedback",
-          ratings: ["partial", "bad"],
-          percent: 0.25,
-          maxCredits: 10,
-        };
-      }
-
-      if (
-        optionListIncludes(job.options, "formats", "json") ||
-        optionListIncludes(job.options, "formats", "screenshot") ||
-        hasActions(job.options)
-      ) {
-        return {
-          mode: "percentage_with_cap",
-          reason: optionListIncludes(job.options, "formats", "json")
+    case "scrape_pdf":
+      return {
+        mode: "percentage_with_cap",
+        reason: "scrape_pdf_feedback",
+        ratings: ["partial", "bad"],
+        percent: 0.25,
+        maxCredits: 10,
+      };
+    case "scrape_json":
+    case "scrape_addon":
+      return {
+        mode: "percentage_with_cap",
+        reason:
+          refundClass === "scrape_json"
             ? "scrape_json_feedback"
             : "scrape_addon_feedback",
-          ratings: ["partial", "bad"],
-          percent: 0.25,
-          maxCredits: 5,
-        };
-      }
-
+        ratings: ["partial", "bad"],
+        percent: 0.25,
+        maxCredits: 5,
+      };
+    case "scrape_basic":
       return {
         mode: "flat",
         reason: "scrape_feedback",
@@ -121,15 +117,36 @@ function policyFor(job: FeedbackJobRow): RefundablePolicy {
   }
 }
 
+function policyFor(job: FeedbackJobRow): RefundablePolicy | null {
+  if (isSessionEndpoint(job.endpoint)) return null;
+  if (job.refund_class) return policyForRefundClass(job.refund_class);
+  if (job.endpoint !== "scrape") return policyForRefundClass(job.endpoint);
+  if (optionListIncludes(job.options, "parsers", "pdf")) {
+    return policyForRefundClass("scrape_pdf");
+  }
+  if (optionListIncludes(job.options, "formats", "json")) {
+    return policyForRefundClass("scrape_json");
+  }
+  if (
+    optionListIncludes(job.options, "formats", "screenshot") ||
+    hasActions(job.options)
+  ) {
+    return policyForRefundClass("scrape_addon");
+  }
+  return policyForRefundClass("scrape_basic");
+}
+
 export function computeRefundPolicy(
   job: FeedbackJobRow,
   rating: FeedbackRating,
 ): { desiredRefund: number; policy: RefundPolicySnapshot } {
   const billedCredits = Math.max(0, job.credits_cost ?? 0);
-  if (!config.FEEDBACK_REFUND_ENABLED) return none(job, "refunds_disabled");
+  if (!feedbackEnv.FEEDBACK_REFUND_ENABLED)
+    return none(job, "refunds_disabled");
   if (billedCredits <= 0) return none(job, "zero_billed_credits");
 
   const policy = policyFor(job);
+  if (!policy) return none(job, "endpoint_not_refundable");
   if (!policy.ratings.includes(rating)) {
     return none(job, "rating_not_refundable", policy.ratings);
   }

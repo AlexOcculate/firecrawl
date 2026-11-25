@@ -1,6 +1,5 @@
 import "dotenv/config";
-import "../sentry";
-import { setSentryServiceTag } from "../sentry";
+import "../../otel";
 import { config } from "../../config";
 import { logger as _logger } from "../../lib/logger";
 import { getCrawl } from "../../lib/crawl-redis";
@@ -13,6 +12,7 @@ import {
 } from "./nuq-fdb";
 import { runNuqWorker } from "./nuq-worker-runner";
 import type { NuQJob } from "./nuq";
+import { startRole } from "../../main";
 
 async function processFinishCrawlJobInternal(_job: NuQJob) {
   const job = await crawlFinishedQueueFdb.getJob(_job.id);
@@ -132,9 +132,7 @@ function startCrawlFinishedLoop() {
   };
 }
 
-(async () => {
-  setSentryServiceTag("nuq-fdb-worker");
-
+export async function start() {
   let crawlFinishedLoop: ReturnType<typeof startCrawlFinishedLoop> | null =
     null;
 
@@ -155,4 +153,8 @@ function startCrawlFinishedLoop() {
       }
     },
   });
-})();
+}
+
+if (require.main === module) {
+  void startRole("nuq-fdb-worker");
+}

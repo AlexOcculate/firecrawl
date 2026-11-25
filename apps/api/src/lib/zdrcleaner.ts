@@ -1,118 +1,132 @@
 import "dotenv/config";
-import { inArray } from "drizzle-orm";
-import { db } from "../db/connection";
-import * as schema from "../db/schema";
-import { getZdrCleanupBatch } from "../db/rpc";
-import { removeJobFromGCS } from "./gcs-jobs";
+import { clickhouseClient } from "./clickhouse-client";
+import { removeJobFromGCS, storage } from "./gcs-jobs";
 import { logger as _logger } from "./logger";
 import { config } from "../config";
+import { setSpanAttributes, withSpan } from "./otel-tracer";
+import type { ZdrCleanupJob } from "./zdr-queue";
+import { zdrWorkerEnv } from "./zdr-worker-env";
 
-async function sendHeartbeat() {
-  if (config.ZDRCLEANER_HEARTBEAT_URL) {
-    fetch(config.ZDRCLEANER_HEARTBEAT_URL).catch(() => {});
+export async function sendZdrHeartbeat() {
+  if (zdrWorkerEnv.ZDRCLEANER_HEARTBEAT_URL) {
+    fetch(zdrWorkerEnv.ZDRCLEANER_HEARTBEAT_URL).catch(() => {});
   }
 }
 
-export async function zdrcleaner() {
+// A request can resolve to a very large number of blobs; issuing every delete
+// at once exhausts the worker's memory.
+const BLOB_DELETE_CONCURRENCY = 50;
+
+async function removeBlobs(blobIds: string[]): Promise<unknown[]> {
   const logger = _logger.child({
     module: "zdrcleaner",
-    method: "zdrcleaner",
+    method: "removeBlobs",
+    zeroDataRetention: true,
   });
-
-  const start = Date.now();
-  try {
-    // Call the RPC to get all blobs (scrapes, searches, extracts, maps, llmstxts, deep_researches)
-    // associated with requests that need cleanup.
-    // The RPC handles the dr_clean_by filtering logic (team-specific vs scheduled)
-    const rows: { request_id: string; ids: string[] }[] =
-      await getZdrCleanupBatch(1000);
-
-    if (!rows || rows.length === 0) {
-      logger.debug("zdrcleaner batch completed with no rows to process", {
-        canonicalLog: "zdrcleaner",
-        success: true,
-        timeMs: Date.now() - start,
-      });
-      await sendHeartbeat();
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      return;
-    }
-
-    const requestBlobs = new Map<string, Set<string>>();
-    const successfulBlobs = new Set<string>();
-
-    // Track all blobs for each request before processing
-    for (const row of rows) {
-      requestBlobs.set(row.request_id, new Set(row.ids));
-    }
-
-    // Process in batches of 50 for GCS cleanup
-    const deleteErrors: any[] = [];
-    for (let j = 0; j < Math.ceil(rows.length / 50); j++) {
-      const batch = rows.slice(j * 50, (j + 1) * 50);
-      await Promise.allSettled(
-        batch
-          .flatMap(x => x.ids)
-          .map(async blob_id => {
-            try {
-              await removeJobFromGCS(
-                blob_id,
-                logger.child({ zeroDataRetention: true }),
-              );
-              successfulBlobs.add(blob_id);
-            } catch (error) {
-              deleteErrors.push(error);
-            }
-          }),
-      );
-    }
-
-    const fullyCleanedRequests: string[] = [];
-    for (const [requestId, blobIds] of requestBlobs) {
-      const allBlobsCleaned = [...blobIds].every(blobId =>
-        successfulBlobs.has(blobId),
-      );
-      if (allBlobsCleaned) {
-        fullyCleanedRequests.push(requestId);
-      }
-    }
-
-    const updateErrors: any[] = [];
-
-    if (fullyCleanedRequests.length > 0) {
+  const errors: unknown[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < blobIds.length) {
+      const blobId = blobIds[next++];
       try {
-        await db
-          .update(schema.requests)
-          .set({ dr_clean_by: null })
-          .where(inArray(schema.requests.id, fullyCleanedRequests));
+        await removeJobFromGCS(blobId, logger);
       } catch (error) {
-        updateErrors.push(error);
+        errors.push(error);
       }
     }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(BLOB_DELETE_CONCURRENCY, blobIds.length) },
+      worker,
+    ),
+  );
+  return errors;
+}
 
-    await sendHeartbeat();
-    if (deleteErrors.length > 0 || updateErrors.length > 0) {
-      logger.warn("zdrcleaner batch completed with errors", {
-        canonicalLog: "zdrcleaner",
-        success: true,
-        deleteErrors,
-        updateErrors,
-        timeMs: Date.now() - start,
-      });
-    } else {
-      logger.debug("zdrcleaner batch completed", {
-        canonicalLog: "zdrcleaner",
-        success: true,
-        deleteErrors,
-        timeMs: Date.now() - start,
+/**
+ * Every result blob a request produced, from the `request_children` table in
+ * the analytics ClickHouse service, which materialized views fill from the
+ * Pub/Sub-ingested scrapes, searches, extracts, maps, llmstxts and
+ * deep_researches rows. The table is created by hand (statements in the PR
+ * that introduced this reader), not by this codebase. Cleanup runs 24 hours after the request, far
+ * beyond ClickPipes ingest lag, so the index is complete by the time it is
+ * read.
+ */
+async function getRequestBlobIds(requestId: string): Promise<string[]> {
+  return withSpan("zdr.clickhouse.read_blobs", async span => {
+    setSpanAttributes(span, {
+      "db.system": "clickhouse",
+      "db.operation.name": "select",
+      "db.collection.name": "request_children",
+      "zdr.request_id": requestId,
+    });
+    if (clickhouseClient === null) {
+      throw new Error(
+        "ClickHouse is not configured; cannot resolve ZDR request blobs",
+      );
+    }
+    const result = await clickhouseClient.query({
+      query:
+        "SELECT DISTINCT id FROM request_children WHERE request_id = {requestId: UUID}",
+      query_params: { requestId },
+      format: "JSONEachRow",
+    });
+    const rows = await result.json<{ id: string }>();
+    const blobIds = rows.map(row => row.id);
+    setSpanAttributes(span, {
+      "db.response.returned_rows": blobIds.length,
+    });
+    return blobIds;
+  });
+}
+
+export async function cleanZdrRequest(requestId: string): Promise<void> {
+  await withSpan("zdr.cleanup.request", async span => {
+    setSpanAttributes(span, { "zdr.request_id": requestId });
+    const blobIds = await getRequestBlobIds(requestId);
+    setSpanAttributes(span, { "zdr.blob_count": blobIds.length });
+    // A request that failed before producing a job row has no children; the
+    // span attribute above is the signal for that, so this stays at debug.
+    if (blobIds.length === 0) {
+      _logger.debug("ZDR request has no indexed result blobs", {
+        module: "zdrcleaner",
+        method: "cleanZdrRequest",
+        zeroDataRetention: true,
+        requestId,
       });
     }
-  } catch (error) {
-    logger.error(`Error looping through cleanup batch`, {
-      canonicalLog: "zdrcleaner",
-      success: false,
-      timeMs: Date.now() - start,
-      error,
-    });
+    const errors = await removeBlobs(blobIds);
+    if (errors.length > 0) {
+      throw new AggregateError(
+        errors,
+        `Failed to remove ${errors.length} blobs for ZDR request ${requestId}`,
+      );
+    }
+    setSpanAttributes(span, { "zdr.cleanup.outcome": "completed" });
+  });
+}
+
+async function removeParseUpload(objectPath: string): Promise<void> {
+  if (!config.GCS_PARSE_UPLOAD_BUCKET_NAME) {
+    throw new Error(
+      "GCS_PARSE_UPLOAD_BUCKET_NAME is not configured; cannot delete parse upload",
+    );
   }
+  await storage
+    .bucket(config.GCS_PARSE_UPLOAD_BUCKET_NAME)
+    .file(objectPath)
+    .delete({ ignoreNotFound: true });
+}
+
+export async function cleanZdrJob(job: ZdrCleanupJob): Promise<void> {
+  if ("blobId" in job) {
+    await removeJobFromGCS(job.blobId);
+    return;
+  }
+  if ("parseUploadPath" in job) {
+    await removeParseUpload(job.parseUploadPath);
+    return;
+  }
+  await cleanZdrRequest(job.requestId);
 }

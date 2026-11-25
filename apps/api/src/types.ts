@@ -6,14 +6,21 @@ import {
   TeamFlags,
 } from "./controllers/v2/types";
 import { AuthCreditUsageChunk } from "./controllers/v1/types";
-import { ExtractorOptions, Document } from "./lib/entities";
+import { ExtractorOptions } from "./lib/entities";
 import { InternalOptions } from "./scraper/scrapeURL";
 import type { CostTracking } from "./lib/cost-tracking";
 import type { BillingMetadata } from "./services/billing/types";
+import type { RequestContext } from "./service/request-context";
 import { webhookSchema } from "./services/webhook/schema";
-import { SerializedTraceContext } from "./lib/otel-tracer";
+import type { SerializedTraceContext } from "./lib/otel-tracer";
 
 type ScrapeJobCommon = {
+  /**
+   * The context of the request this job belongs to. A job created from
+   * another job has its parent's, copied whole. Absent on a payload written
+   * before the context existed; read it with `jobContext`.
+   */
+  ctx?: RequestContext;
   concurrencyLimited?: boolean;
   team_id: string;
   zeroDataRetention: boolean;
@@ -60,7 +67,6 @@ type ScrapeJobSingleUrlsUnique = {
   from_extract?: boolean;
   startTime?: number;
 
-  sentry?: any;
   is_extract?: boolean;
   apiKeyId: number | null;
 
@@ -114,51 +120,27 @@ export interface RunWebScraperParams {
   costTracking: CostTracking;
 }
 
-export interface FirecrawlScrapeResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    data: Document;
-  };
-  error?: string;
-}
-
-export interface FirecrawlCrawlResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    jobId: string;
-  };
-  error?: string;
-}
-
-export interface FirecrawlCrawlStatusResponse {
-  statusCode: number;
-  body: {
-    status: string;
-    data: Document[];
-  };
-  error?: string;
-}
-
 export enum RateLimiterMode {
   Crawl = "crawl",
   CrawlStatus = "crawlStatus",
   Scrape = "scrape",
-  ScrapeAgentPreview = "scrapeAgentPreview",
   Preview = "preview",
   Search = "search",
   Map = "map",
   Extract = "extract",
   ExtractStatus = "extractStatus",
-  ExtractAgentPreview = "extractAgentPreview",
   Browser = "browser",
   BrowserExecute = "browserExecute",
   BrowserReplay = "browserReplay",
   Account = "account",
   SupportAsk = "supportAsk",
-  SupportDocsSearch = "supportDocsSearch",
   Research = "research",
+  DeveloperSearch = "developerSearch",
+  GovSearch = "govSearch",
+  Labs = "labs",
+  Exchange = "exchange",
+  ExchangeDiscover = "exchangeDiscover",
+  FreshFeed = "freshFeed",
 }
 
 export type AuthResponse =
@@ -168,6 +150,8 @@ export type AuthResponse =
       org_id?: string | null;
       api_key?: string;
       chunk: AuthCreditUsageChunk | null;
+      // The hosted MCP made the call, as verified in supaAuthenticateUser.
+      hostedMcp?: boolean;
     }
   | {
       success: false;
@@ -176,6 +160,11 @@ export type AuthResponse =
       // When true, send the agent OAuth-discovery WWW-Authenticate header even on
       // non-401 responses (e.g. keyless cap 429s) so agents can find the key flow.
       agentAuthDiscovery?: boolean;
+      // Machine-readable keyless quota details for trusted MCP recovery.
+      keylessReason?: "requests" | "credits";
+      retryAfterSeconds?: number;
+      // Keyless prompts: the signup link in `error`, for clients that relay it.
+      signupUrl?: string;
     };
 
 export enum NotificationType {

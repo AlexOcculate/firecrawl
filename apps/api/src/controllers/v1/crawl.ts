@@ -18,6 +18,7 @@ import { _addScrapeJobToBullMQ } from "../../services/queue-jobs";
 import { logger as _logger } from "../../lib/logger";
 import { fromV1ScrapeOptions } from "../v2/types";
 import { checkPermissions } from "../../lib/permissions";
+import { resolveSafeMode } from "../../lib/safe-mode";
 import {
   actionTypesOf,
   checkKeyFormatRestriction,
@@ -28,12 +29,17 @@ import {
   resolveNewGroupBackend,
 } from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { resolveThreatProtection } from "../../lib/threat-protection/request";
 import { checkUrl } from "../../lib/threat-protection";
 import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
 import { calculateThreatScanCredits } from "../../lib/scrape-billing";
 import { billTeam } from "../../services/billing/credit_billing";
+import { emitRejectedScrapeActivityEvent } from "../../lib/siem-logging";
+import { requestCreditsShards } from "../../lib/request-credits-store";
+import { DEFAULT_TEAM_LIMITS } from "../../services/autumn/autumn.service";
+import { withWebhookSummaryForLog } from "../../services/webhook/log";
 
 export async function crawlController(
   req: RequestWithAuth<{}, CrawlResponse, CrawlRequest>,
@@ -41,12 +47,33 @@ export async function crawlController(
 ) {
   const preNormalizedBody = req.body;
   req.body = crawlRequestSchema.parse(req.body);
+  const id = uuidv7();
+
+  const safeMode = resolveSafeMode(
+    req.acuc?.flags,
+    req.body.scrapeOptions?.safeMode,
+    req.body.url,
+  );
+  if (safeMode.error) {
+    return res.status(403).json({
+      success: false,
+      code: safeMode.code,
+      error: safeMode.error,
+    } as any);
+  }
+
+  // Safe Mode lockdown is cache-only, which implies zero data retention.
+  const zeroDataRetention =
+    getScrapeZDR(req.acuc?.flags) === "forced" ||
+    req.body.zeroDataRetention ||
+    (safeMode.safeMode?.lockdown ?? false);
 
   const threatProtection = await resolveThreatProtection({
     teamId: req.auth.team_id,
     orgId: req.acuc?.org_id ?? null,
     flags: req.acuc?.flags ?? null,
     override: req.body.scrapeOptions?.threatProtection,
+    force: safeMode.safeMode?.domainControls === true,
   });
   if (threatProtection.error) {
     return res.status(403).json({
@@ -55,14 +82,27 @@ export async function crawlController(
     });
   }
 
+  // Scrape params live under scrapeOptions; checkPermissions reads them
+  // top-level, so spread scrapeOptions while keeping the top-level fields it
+  // also reads (zeroDataRetention, crawlerOptions.ignoreRobotsTxt) and the
+  // nested scrapeOptions (location / threatProtection).
   const permissions = checkPermissions(
-    { ...req.body, crawlerOptions: req.body },
+    {
+      ...req.body.scrapeOptions,
+      zeroDataRetention: req.body.zeroDataRetention,
+      crawlerOptions: req.body,
+      scrapeOptions: req.body.scrapeOptions,
+    },
     req.acuc?.flags,
-    { threatProtectionOrgConfig: threatProtection.orgConfig },
+    {
+      threatProtectionOrgConfig: threatProtection.orgConfig,
+      safeMode: safeMode.safeMode ?? null,
+    },
   );
   if (permissions.error) {
     return res.status(403).json({
       success: false,
+      code: permissions.code,
       error: permissions.error,
     });
   }
@@ -80,9 +120,13 @@ export async function crawlController(
       if (threatScanCredits > 0) {
         billTeam(
           req.auth.team_id,
+          req.acuc?.org_id ?? null,
           threatScanCredits,
           req.acuc?.api_key_id ?? null,
-          { endpoint: "crawl" },
+          // No chargeId: a fresh crawl id is minted per request and the
+          // rejected crawl is never persisted or queued, so there is no
+          // stable per-charge identity that could dedupe a retry.
+          { endpoint: "crawl", externalRequestId: externalRequestId(req) },
         ).catch(error => {
           _logger.error(
             `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
@@ -90,6 +134,20 @@ export async function crawlController(
         });
       }
       const error = new UnsafeDomainBlockedError(req.body.url, decision);
+      emitRejectedScrapeActivityEvent({
+        scrapeId: uuidv7(),
+        requestId: id,
+        endpoint: "crawl",
+        teamId: req.auth.team_id,
+        apiKeyId: req.acuc?.api_key_id ?? null,
+        auditMetadata: req.body.scrapeOptions?.auditMetadata,
+        url: req.body.url,
+        error,
+        threatDecisions: [decision],
+        origin: req.body.origin ?? "api",
+        integration: req.body.integration,
+        zeroDataRetention: zeroDataRetention ?? false,
+      });
       return res.status(403).json({
         success: false,
         code: error.code,
@@ -111,10 +169,6 @@ export async function crawlController(
     });
   }
 
-  const zeroDataRetention =
-    getScrapeZDR(req.acuc?.flags) === "forced" || req.body.zeroDataRetention;
-
-  const id = uuidv7();
   const logger = _logger.child({
     crawlId: id,
     module: "api/v1",
@@ -124,8 +178,8 @@ export async function crawlController(
   });
 
   logger.debug("Crawl " + id + " starting", {
-    request: req.body,
-    originalRequest: preNormalizedBody,
+    request: withWebhookSummaryForLog(req.body),
+    originalRequest: withWebhookSummaryForLog(preNormalizedBody),
     account: req.account,
   });
 
@@ -133,12 +187,17 @@ export async function crawlController(
     id,
     kind: "crawl",
     api_version: "v1",
+    external_request_id: externalRequestId(req),
     team_id: req.auth.team_id,
     origin: req.body.origin ?? "api",
     integration: req.body.integration,
     target_hint: req.body.url,
     zeroDataRetention: zeroDataRetention || false,
     api_key_id: req.acuc?.api_key_id ?? null,
+    jobAccessExpiresAt: new Date(
+      Date.now() + (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+    ),
+    creditsShards: requestCreditsShards(req.body.limit ?? 10_000),
   });
 
   // checkCreditsMiddleware (always runs before this controller) is the source
@@ -163,6 +222,12 @@ export async function crawlController(
     bodyScrapeOptions.timeout,
     req.auth.team_id,
   );
+  if (safeMode.safeMode?.lockdown) {
+    scrapeOptions.maxAge =
+      typeof preNormalizedBody?.scrapeOptions?.maxAge === "number"
+        ? preNormalizedBody.scrapeOptions.maxAge
+        : undefined;
+  }
 
   // TODO: @rafa, is this right? copied from v0
   if (Array.isArray(crawlerOptions.includePaths)) {
@@ -206,18 +271,24 @@ export async function crawlController(
       zeroDataRetention,
       agentIndexOnly: (req as any).agentIndexOnly ?? false,
       threatProtection: threatProtection.policy ?? undefined,
+      // Safe Mode resolves per-URL at the scrapeURL backstop from these flags.
+      teamFlags: req.acuc?.flags ?? null,
+      safeModeBypassed: safeMode.bypassed === true,
     }, // NOTE: smart wait disabled for crawls to ensure contentful scrape, speed does not matter
     team_id: req.auth.team_id,
     createdAt: Date.now(),
     maxConcurrency:
       req.body.maxConcurrency !== undefined
-        ? req.acuc?.concurrency !== undefined
-          ? Math.min(req.body.maxConcurrency, req.acuc.concurrency)
-          : req.body.maxConcurrency
+        ? Math.min(
+            req.body.maxConcurrency,
+            req.acuc?.concurrency_limit ??
+              DEFAULT_TEAM_LIMITS.concurrency_limit,
+          )
         : undefined,
     zeroDataRetention,
     v1: true,
     webhook: req.body.webhook,
+    origin: req.body.origin,
   };
 
   const crawler = crawlToCrawler(id, sc, req.acuc?.flags ?? null);
@@ -260,7 +331,11 @@ export async function crawlController(
       internalOptions: sc.internalOptions,
       origin: req.body.origin,
       integration: req.body.integration,
-      billing: { endpoint: "crawl", jobId: id },
+      billing: {
+        endpoint: "crawl",
+        jobId: id,
+        externalRequestId: externalRequestId(req),
+      },
       crawl_id: id,
       webhook: req.body.webhook,
       v1: true,

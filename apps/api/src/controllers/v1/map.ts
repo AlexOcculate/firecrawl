@@ -18,19 +18,18 @@ import {
   removeDuplicateUrls,
 } from "../../lib/validateUrl";
 import { fireEngineMap } from "../../search/fireEngine";
+import { isUsOnly } from "../../lib/us-only";
 import { billTeam } from "../../services/billing/credit_billing";
 import { logMap, logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { performCosineSimilarity } from "../../lib/map-cosine";
 import { logger } from "../../lib/logger";
 import Redis from "ioredis";
-import {
-  generateURLSplits,
-  queryIndexAtDomainSplitLevel,
-  queryIndexAtSplitLevel,
-} from "../../services/index";
+import { queryIndex } from "../../lib/map-utils";
 import { MapTimeoutError } from "../../lib/error";
 import { checkPermissions } from "../../lib/permissions";
-import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { resolveSafeMode } from "../../lib/safe-mode";
+import { getScrapeZDR, getSearchForcedKind } from "../../lib/zdr-helpers";
 import {
   checkUrlsAgainstThreatPolicy,
   resolveThreatProtection,
@@ -50,39 +49,6 @@ interface MapResult {
   job_id: string;
   time_taken: number;
   mapResults: MapDocument[];
-}
-
-async function queryIndex(
-  url: string,
-  limit: number,
-  useIndex: boolean,
-  includeSubdomains: boolean,
-): Promise<string[]> {
-  if (!useIndex) {
-    return [];
-  }
-
-  const urlSplits = generateURLSplits(url);
-  if (urlSplits.length === 1) {
-    const urlObj = new URL(url);
-    const hostname = urlObj.hostname;
-
-    // TEMP: this should be altered on June 15th 2025 7AM PT - mogery
-    const [domainLinks, splitLinks] = await Promise.all([
-      includeSubdomains
-        ? queryIndexAtDomainSplitLevel(
-            hostname,
-            limit,
-            14 * 24 * 60 * 60 * 1000,
-          )
-        : [],
-      queryIndexAtSplitLevel(url, limit, 14 * 24 * 60 * 60 * 1000),
-    ]);
-
-    return Array.from(new Set([...domainLinks, ...splitLinks]));
-  } else {
-    return await queryIndexAtSplitLevel(url, limit);
-  }
 }
 
 export async function getMapResults({
@@ -135,7 +101,19 @@ export async function getMapResults({
   let links: string[] = [url];
   let mapResults: MapDocument[] = [];
 
-  const zeroDataRetention = getScrapeZDR(flags) === "forced" || false;
+  // Safe Mode lockdown: serve links from the index only — skip the live
+  // fireEngineMap search and any sitemap fetch (both are live discovery).
+  // Derived from the team flags so every caller honors it.
+  const indexOnly =
+    resolveSafeMode(flags, undefined, url).safeMode?.lockdown === true;
+
+  // Lockdown (index-only) is cache-only, which implies zero data retention.
+  // The site search is a query sent to a search provider, so it also follows
+  // the team's search zero data retention.
+  const zeroDataRetention =
+    getScrapeZDR(flags) === "forced" ||
+    getSearchForcedKind(flags) === "zdr" ||
+    indexOnly;
 
   const sc: StoredCrawl = {
     originUrl: url,
@@ -203,13 +181,17 @@ export async function getMapResults({
       Math.min(MAX_FIRE_ENGINE_RESULTS, limit) / resultsPerPage,
     );
 
-    const cacheKey = `fireEngineMap:${mapUrl}`;
+    const usOnly = isUsOnly(flags);
+    const cacheKey = `fireEngineMap:${usOnly ? "us-only:" : ""}${mapUrl}`;
     const cachedResult = ignoreCache ? null : await redis.get(cacheKey);
 
     let allResults: any[] = [];
     let pagePromises: Promise<any>[] = [];
 
-    if (cachedResult) {
+    if (indexOnly) {
+      // Lockdown: no live search discovery, serve from the index only.
+      allResults = [];
+    } else if (cachedResult) {
       allResults = JSON.parse(cachedResult);
     } else {
       const fetchPage = async (page: number) => {
@@ -218,6 +200,8 @@ export async function getMapResults({
           {
             numResults: resultsPerPage,
             page: page,
+            usOnly,
+            zeroDataRetention,
           },
           abort,
         );
@@ -245,12 +229,12 @@ export async function getMapResults({
     ]);
 
     if (indexResults.length > 0) {
-      links.push(...indexResults);
+      links.push(...indexResults.map(x => x.url));
     }
 
     // If sitemap is not ignored, fetch sitemap
     // This will attempt to find it in the index at first, or fetch a fresh one if it's older than 2 days
-    if (!ignoreSitemap) {
+    if (!ignoreSitemap && !indexOnly) {
       try {
         await crawler.tryGetSitemap(
           urls => {
@@ -386,11 +370,37 @@ export async function mapController(
     });
   }
 
+  // Safe Mode: force domainControls so discovered links are filtered, and
+  // serve index-only under lockdown (no sitemap/robots fetch to the target).
+  const safeMode = resolveSafeMode(req.acuc?.flags, undefined, req.body.url);
+  const lockdownIndexOnly = safeMode.safeMode?.lockdown === true;
+  if (lockdownIndexOnly) {
+    // Lockdown: serve links from the index only — no live search / sitemap /
+    // robots discovery. A sitemapOnly request keeps its contract and simply
+    // yields no links (the sitemap can't be fetched under lockdown).
+    req.body.useIndex = true;
+  }
+  // Map's ignoreRobotsTxt is top-level, so checkPermissions (which reads it
+  // under crawlerOptions) can't see it — enforce robots here for Safe Mode.
+  if (
+    safeMode.safeMode?.enforceRobots &&
+    !lockdownIndexOnly &&
+    req.body.ignoreRobotsTxt
+  ) {
+    return res.status(403).json({
+      success: false,
+      code: "SAFE_MODE_BLOCKED",
+      error:
+        "Safe Mode: robots.txt is always honored for your organization; the ignoreRobotsTxt parameter is not allowed.",
+    });
+  }
+
   const threatProtection = await resolveThreatProtection({
     teamId: req.auth.team_id,
     orgId: req.acuc?.org_id ?? null,
     flags: req.acuc?.flags ?? null,
     override: req.body.threatProtection,
+    force: safeMode.safeMode?.domainControls === true,
   });
   if (threatProtection.error) {
     return res.status(403).json({
@@ -401,10 +411,12 @@ export async function mapController(
 
   const permissions = checkPermissions(req.body, req.acuc?.flags, {
     threatProtectionOrgConfig: threatProtection.orgConfig,
+    safeMode: safeMode.safeMode ?? null,
   });
   if (permissions.error) {
     return res.status(403).json({
       success: false,
+      code: permissions.code,
       error: permissions.error,
     });
   }
@@ -424,11 +436,12 @@ export async function mapController(
     id: mapId,
     kind: "map",
     api_version: "v1",
+    external_request_id: externalRequestId(req),
     team_id: req.auth.team_id,
     origin: req.body.origin ?? "api",
     integration: req.body.integration,
     target_hint: req.body.url,
-    zeroDataRetention: false, // not supported for map
+    zeroDataRetention: lockdownIndexOnly,
     api_key_id: req.acuc?.api_key_id ?? null,
   });
 
@@ -490,12 +503,20 @@ export async function mapController(
   // Threat protection: remove blocked links from the returned URL list
   // entirely. Checks are URL-level; scan fees bill +2 per unique scanned
   // URL (see calculateThreatScanCredits).
+  //
+  // "zscaler" mode evaluates map results against local rules only, same as
+  // the v2 map controller: one map can return thousands of URLs, and inline
+  // classification would burn the tenant's 400/hour urlLookup budget on
+  // links that may never be fetched.
   let threatScanCredits = 0;
   if (threatProtection.policy && result.links.length > 0) {
     const { decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
       result.links,
       threatProtection.policy,
-      { teamId: req.auth.team_id },
+      {
+        teamId: req.auth.team_id,
+        localRulesOnly: threatProtection.policy.mode === "zscaler",
+      },
     );
     threatScanCredits = calculateThreatScanCredits(decisionsByUrl.values());
     result.links = result.links.filter(x => {
@@ -506,10 +527,18 @@ export async function mapController(
 
   // Bill the team
   const creditsToBill = 1 + threatScanCredits;
-  billTeam(req.auth.team_id, creditsToBill, req.acuc?.api_key_id ?? null, {
-    endpoint: "map",
-    jobId: mapId,
-  }).catch(error => {
+  billTeam(
+    req.auth.team_id,
+    req.acuc?.org_id ?? null,
+    creditsToBill,
+    req.acuc?.api_key_id ?? null,
+    {
+      endpoint: "map",
+      externalRequestId: externalRequestId(req),
+      jobId: mapId,
+      chargeId: mapId,
+    },
+  ).catch(error => {
     logger.error(
       `Failed to bill team ${req.auth.team_id} for ${creditsToBill} credit(s): ${error}`,
     );
@@ -533,7 +562,9 @@ export async function mapController(
     },
     results: result.links,
     credits_cost: creditsToBill,
-    zeroDataRetention: false, // not supported
+    zeroDataRetention: lockdownIndexOnly,
+  }).catch(error => {
+    logger.error("Failed to log map", { error, mapId });
   });
 
   // Log final timing information

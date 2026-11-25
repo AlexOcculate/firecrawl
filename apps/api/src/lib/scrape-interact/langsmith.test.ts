@@ -7,7 +7,7 @@ import * as ai from "ai";
 
 // langsmith.ts pulls the SDK in via lazy require() (not static import), and
 // vi.doMock only intercepts dynamic import(), not require(). So these two are
-// mocked statically (hoisted, like jest.mock) with a mutable backing the enabled
+// mocked statically (hoisted by vi.mock) with a mutable backing the enabled
 // tests wire up per-run. The disabled tests never hit the require() branch
 // (isLangSmithEnabled is false), so these factories simply never execute there.
 const sdkMocks = vi.hoisted(() => ({
@@ -37,11 +37,11 @@ vi.mock("langsmith/traceable", () => ({
 describe("scrape-interact/langsmith (disabled — no API key)", () => {
   beforeEach(() => {
     vi.resetModules();
-    // Mock config to ensure LANGSMITH_API_KEY is unset regardless of what's
+    // Mock browserEnv to ensure LANGSMITH_API_KEY is unset regardless of what's
     // in the developer's local .env file — this keeps the disabled-path
     // tests hermetic.
-    vi.doMock("../../config", () => ({
-      config: {
+    vi.doMock("../browser-env", () => ({
+      browserEnv: {
         LANGSMITH_API_KEY: undefined,
         LANGSMITH_TRACING: undefined,
         LANGSMITH_PROJECT: undefined,
@@ -51,7 +51,7 @@ describe("scrape-interact/langsmith (disabled — no API key)", () => {
   });
 
   afterEach(() => {
-    vi.doUnmock("../../config");
+    vi.doUnmock("../browser-env");
   });
 
   it("reports disabled when LANGSMITH_API_KEY is unset", async () => {
@@ -103,8 +103,8 @@ describe("scrape-interact/langsmith (disabled — no API key)", () => {
 
   it("treats an API key alone (no LANGSMITH_TRACING) as disabled", async () => {
     vi.resetModules();
-    vi.doMock("../../config", () => ({
-      config: {
+    vi.doMock("../browser-env", () => ({
+      browserEnv: {
         LANGSMITH_API_KEY: "real-looking-key",
         LANGSMITH_TRACING: undefined,
         LANGSMITH_PROJECT: undefined,
@@ -117,8 +117,8 @@ describe("scrape-interact/langsmith (disabled — no API key)", () => {
 
   it("treats whitespace-only LANGSMITH_API_KEY as disabled", async () => {
     vi.resetModules();
-    vi.doMock("../../config", () => ({
-      config: {
+    vi.doMock("../browser-env", () => ({
+      browserEnv: {
         LANGSMITH_API_KEY: "   \t\n  ",
         LANGSMITH_TRACING: true,
         LANGSMITH_PROJECT: undefined,
@@ -154,11 +154,11 @@ describe("scrape-interact/langsmith (enabled — mocked SDK)", () => {
   // NOTE: langsmith.ts loads the SDK via a lazy CommonJS require() at module
   // eval time (intentionally, so a missing install degrades gracefully). Vitest
   // injects a *native* require() into ESM source that bypasses the mock registry,
-  // so vi.mock / vi.doMock cannot intercept these. Under Jest these were mocked
-  // via jest.doMock + require. The only ways to restore this coverage are to
-  // change production source (make the SDK load a dynamic import / top-level
-  // await), which would alter module-init semantics. Skipped pending that
-  // decision — the disabled path (the default) remains fully covered above.
+  // so vi.mock / vi.doMock cannot intercept these. The only ways to restore
+  // this coverage are to change production source (make the SDK load a
+  // dynamic import / top-level await), which would alter module-init
+  // semantics. Skipped pending that decision — the disabled path (the
+  // default) remains fully covered above.
 
   const ORIGINAL_ENV = { ...process.env };
   const fakeWrappedFns = {
@@ -193,8 +193,8 @@ describe("scrape-interact/langsmith (enabled — mocked SDK)", () => {
     // Mock config with only the fields the module reads so the test is
     // hermetic — it doesn't depend on the developer's local .env making it
     // through the zod schema at require time.
-    vi.doMock("../../config", () => ({
-      config: {
+    vi.doMock("../browser-env", () => ({
+      browserEnv: {
         LANGSMITH_API_KEY: "test-fake-key",
         LANGSMITH_TRACING: true,
         LANGSMITH_PROJECT: "test-project",
@@ -206,7 +206,7 @@ describe("scrape-interact/langsmith (enabled — mocked SDK)", () => {
   afterEach(() => {
     process.env = { ...ORIGINAL_ENV };
     sdkMocks.vercelThrows = false;
-    vi.doUnmock("../../config");
+    vi.doUnmock("../browser-env");
   });
 
   it.skip("reports enabled and swaps generateText for the wrapped fn", async () => {

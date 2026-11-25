@@ -5,7 +5,10 @@ import {
 } from "../../../controllers/v1/types";
 import { getMapResults } from "../../../controllers/v1/map";
 import { removeDuplicateUrls } from "../../validateUrl";
-import { isUrlBlocked } from "../../../scraper/WebScraper/utils/blocklist";
+import { requestContext } from "../../request-context";
+import { isLockdownZeroDataRetention } from "../../safe-mode";
+import { getScrapeZDR } from "../../zdr-helpers";
+import { service } from "../../../service";
 import { buildPreRerankPrompt, buildRefrasedPrompt } from "../build-prompts";
 import { rerankLinksWithLLM_F0 } from "./reranker-f0";
 import { extractConfig } from "../config";
@@ -14,13 +17,18 @@ import { generateText } from "ai";
 import { getModel } from "../../generic-ai";
 import { CostTracking } from "../../cost-tracking";
 import { getACUCTeam } from "../../../controllers/auth";
+import { aiTelemetry } from "../../ai-telemetry";
 
 export async function generateBasicCompletion_FO(
   prompt: string,
   metadata: { teamId: string; extractId?: string },
+  teamFlags?: TeamFlags | null,
 ) {
   const { text } = await generateText({
-    model: getModel("gpt-4o-mini"),
+    model: getModel("gpt-4o-mini", undefined, {
+      teamFlags,
+      feature: "Extract",
+    }),
     prompt: prompt,
     temperature: 0,
     providerOptions: {
@@ -32,7 +40,7 @@ export async function generateBasicCompletion_FO(
         },
       },
     },
-    experimental_telemetry: {
+    telemetry: aiTelemetry({
       isEnabled: true,
       functionId: "generateBasicCompletion_F0",
       metadata: {
@@ -44,7 +52,7 @@ export async function generateBasicCompletion_FO(
           : {}),
         teamId: metadata.teamId,
       },
-    },
+    }),
   });
   return text;
 }
@@ -79,11 +87,20 @@ export async function processUrl_F0(
 
   if (!options.url.includes("/*") && !options.allowExternalLinks) {
     if (
-      !isUrlBlocked(options.url, teamFlags, {
-        team_id: options.teamId,
-        org_id: options.orgId ?? null,
-        origin: options.origin ?? null,
-      })
+      !service.modules.blocklist.isBlocked(
+        options.url,
+        requestContext({
+          teamId: options.teamId,
+          zeroDataRetention:
+            getScrapeZDR(teamFlags ?? undefined) === "forced" ||
+            isLockdownZeroDataRetention(teamFlags, undefined),
+          flags: teamFlags,
+          orgId: options.orgId ?? null,
+        }),
+        {
+          origin: options.origin ?? null,
+        },
+      )
     ) {
       trace.usedInCompletion = true;
       return [options.url];
@@ -105,6 +122,7 @@ export async function processUrl_F0(
         await generateBasicCompletion_FO(
           buildRefrasedPrompt(options.prompt, baseUrl),
           { teamId: options.teamId, extractId: options.extractId },
+          teamFlags,
         )
       )
         ?.replace('"', "")
@@ -231,6 +249,7 @@ export async function processUrl_F0(
         (await generateBasicCompletion_FO(
           buildPreRerankPrompt(rephrasedPrompt, options.schema, baseUrl),
           { teamId: options.teamId, extractId: options.extractId },
+          teamFlags,
         )) ??
         "Extract the data according to the schema: " +
           JSON.stringify(options.schema, null, 2);
@@ -263,6 +282,7 @@ export async function processUrl_F0(
           functionId: "processUrl_F0",
           extractId: options.extractId,
         },
+        teamFlags,
       },
       new CostTracking(),
     );
@@ -285,6 +305,7 @@ export async function processUrl_F0(
             functionId: "processUrl_F0",
             extractId: options.extractId,
           },
+          teamFlags,
         },
         new CostTracking(),
       );

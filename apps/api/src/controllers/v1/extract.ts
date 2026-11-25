@@ -10,9 +10,14 @@ import { addExtractJobToQueue } from "../../services/queue-service";
 import { saveExtract } from "../../lib/extract/extract-redis";
 import { getTeamIdSyncB } from "../../lib/extract/team-id-sync";
 import { ExtractResult } from "../../lib/extract/types";
-import { performExtraction_F0 } from "../../lib/extract/fire-0/extraction-service-f0";
+import {
+  checkExtractAvailable,
+  performExtraction_F0,
+} from "../../lib/extract/fire-0/extraction-service-f0";
 import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
-import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
+import { requestContext } from "../../lib/request-context";
+import { isLockdownZeroDataRetention } from "../../lib/safe-mode";
+import { service } from "../../service";
 import { logger as _logger } from "../../lib/logger";
 import {
   fromV1ScrapeOptions,
@@ -20,9 +25,9 @@ import {
 } from "../v2/types";
 import { createWebhookSender, WebhookEvent } from "../../services/webhook";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 
-import { config } from "../../config";
 import {
   checkUrlsAgainstThreatPolicy,
   resolveThreatProtection,
@@ -30,6 +35,12 @@ import {
 import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
 import { calculateThreatScanCredits } from "../../lib/scrape-billing";
 import { billTeam } from "../../services/billing/credit_billing";
+import { emitRejectedScrapeActivityEvents } from "../../lib/siem-logging";
+import { UnsupportedSiteError } from "../../lib/error";
+import { ipWhitelistRefusal } from "../../lib/permissions";
+import { UsOnlyUnavailableError } from "../../scraper/scrapeURL/error";
+import { isSdkOrigin } from "../../lib/sdk-origin";
+import { withWebhookSummaryForLog } from "../../services/webhook/log";
 async function oldExtract(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
   res: Response<ExtractResponse>,
@@ -68,6 +79,7 @@ async function oldExtract(
       request,
       teamId: req.auth.team_id,
       apiKeyId: req.acuc?.api_key_id ?? null,
+      externalRequestId: externalRequestId(req),
     });
 
     if (sender) {
@@ -108,9 +120,9 @@ export async function extractController(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
   res: Response<ExtractResponse>,
 ) {
-  const selfHosted = config.USE_DB_AUTHENTICATION !== true;
   const originalRequest = { ...req.body };
   req.body = extractRequestSchema.parse(req.body);
+  const extractId = uuidv7();
 
   if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
@@ -120,14 +132,59 @@ export async function extractController(
     });
   }
 
+  try {
+    checkExtractAvailable(req.acuc?.flags);
+  } catch (error) {
+    if (!(error instanceof UsOnlyUnavailableError)) throw error;
+    return res.status(403).json({
+      success: false,
+      code: error.code,
+      error: error.message,
+    });
+  }
+
+  const ipWhitelistError = ipWhitelistRefusal(
+    req.acuc?.flags,
+    req.body.scrapeOptions?.location?.country,
+    req.body.scrapeOptions?.geolocation?.country,
+  );
+  if (ipWhitelistError) {
+    return res.status(403).json({
+      success: false,
+      error: ipWhitelistError,
+    });
+  }
+
+  const blockCtx = requestContext({
+    teamId: req.auth.team_id,
+    zeroDataRetention:
+      getScrapeZDR(req.acuc?.flags) === "forced" ||
+      isLockdownZeroDataRetention(req.acuc?.flags, undefined),
+    flags: req.acuc?.flags ?? null,
+    orgId: req.acuc?.org_id ?? null,
+  });
   const invalidURLs: string[] =
     req.body.urls?.filter((url: string) =>
-      isUrlBlocked(url, req.acuc?.flags ?? null, {
-        team_id: req.auth.team_id,
-        org_id: req.acuc?.org_id ?? null,
+      service.modules.blocklist.isBlocked(url, blockCtx, {
         origin: req.body.origin ?? null,
       }),
     ) ?? [];
+
+  emitRejectedScrapeActivityEvents(
+    invalidURLs.map(url => ({
+      scrapeId: uuidv7(),
+      requestId: extractId,
+      endpoint: "extract",
+      teamId: req.auth.team_id,
+      apiKeyId: req.acuc?.api_key_id ?? null,
+      auditMetadata: req.body.scrapeOptions?.auditMetadata,
+      url,
+      error: new UnsupportedSiteError(),
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      zeroDataRetention: false,
+    })),
+  );
 
   const createdAt = Date.now();
 
@@ -171,9 +228,16 @@ export async function extractController(
     if (threatScanCredits > 0) {
       billTeam(
         req.auth.team_id,
+        req.acuc?.org_id ?? null,
         threatScanCredits,
         req.acuc?.api_key_id ?? null,
-        { endpoint: "extract" },
+        {
+          endpoint: "extract",
+          externalRequestId: externalRequestId(req),
+          // Suffixed: the extract's MAIN charge (fire-0) uses the bare
+          // extractId — a shared key would collapse the two into one charge.
+          chargeId: `${extractId}:threat`,
+        },
       ).catch(error => {
         _logger.error(
           `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
@@ -181,6 +245,27 @@ export async function extractController(
       });
     }
     if (blocked.length > 0) {
+      emitRejectedScrapeActivityEvents(
+        blocked
+          .filter(blockedUrl => !invalidURLs.includes(blockedUrl.url))
+          .map(blockedUrl => ({
+            scrapeId: uuidv7(),
+            requestId: extractId,
+            endpoint: "extract",
+            teamId: req.auth.team_id,
+            apiKeyId: req.acuc?.api_key_id ?? null,
+            auditMetadata: req.body.scrapeOptions?.auditMetadata,
+            url: blockedUrl.url,
+            error: new UnsafeDomainBlockedError(
+              blockedUrl.url,
+              blockedUrl.decision,
+            ),
+            threatDecisions: [blockedUrl.decision],
+            origin: req.body.origin ?? "api",
+            integration: req.body.integration,
+            zeroDataRetention: false,
+          })),
+      );
       if (req.body.ignoreInvalidURLs) {
         invalidURLs.push(...blocked.map(x => x.url));
       } else {
@@ -195,11 +280,9 @@ export async function extractController(
     }
   }
 
-  const extractId = uuidv7();
-
   _logger.info("Extract starting...", {
-    request: req.body,
-    originalRequest,
+    request: withWebhookSummaryForLog(req.body),
+    originalRequest: withWebhookSummaryForLog(originalRequest),
     teamId: req.auth.team_id,
     team_id: req.auth.team_id,
     extractId,
@@ -210,6 +293,7 @@ export async function extractController(
     id: extractId,
     kind: "extract",
     api_version: "v1",
+    external_request_id: externalRequestId(req),
     team_id: req.auth.team_id,
     origin: req.body.origin ?? "api",
     integration: req.body.integration,
@@ -235,6 +319,7 @@ export async function extractController(
     extractId,
     agent: req.body.agent,
     apiKeyId: req.acuc?.api_key_id ?? null,
+    externalRequestId: externalRequestId(req),
     createdAt,
   };
 
@@ -242,8 +327,7 @@ export async function extractController(
     (await getTeamIdSyncB(req.auth.team_id)) &&
     req.body.origin !== "api-sdk" &&
     req.body.origin !== "website" &&
-    !req.body.origin.startsWith("python-sdk@") &&
-    !req.body.origin.startsWith("js-sdk@")
+    !isSdkOrigin(req.body.origin)
   ) {
     return await oldExtract(req, res, extractId);
   }

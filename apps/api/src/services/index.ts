@@ -4,9 +4,7 @@ import * as schema from "../db/schema";
 import {
   insertOmceJobIfNeeded,
   queryIndexAtSplitLevel as rpcQueryIndexAtSplitLevel,
-  queryIndexAtDomainSplitLevel as rpcQueryIndexAtDomainSplitLevel,
   queryOmceSignatures as rpcQueryOmceSignatures,
-  queryEngpickerVerdict as rpcQueryEngpickerVerdict,
   queryIndexAtSplitLevelWithMeta as rpcQueryIndexAtSplitLevelWithMeta,
   queryIndexAtDomainSplitLevelWithMeta as rpcQueryIndexAtDomainSplitLevelWithMeta,
   queryDomainPriority as rpcQueryDomainPriority,
@@ -22,12 +20,13 @@ import {
   type IndexCacheEntry,
 } from "./index-cache";
 import type { Logger } from "winston";
-import psl from "psl";
+import { parseHostname } from "../lib/url-utils";
 import { MapDocument } from "../controllers/v2/types";
 import type { PdfMetadata } from "../scraper/scrapeURL/engines/pdf/types";
 import { storage } from "../lib/gcs-jobs";
 import { withSpan, setSpanAttributes } from "../lib/otel-tracer";
 import { config } from "../config";
+import { searchIndexEnv } from "../lib/search-index-env";
 import { getGcsScreenshotUrlResignReason } from "./index-screenshot-url";
 configDotenv();
 
@@ -118,7 +117,6 @@ export async function saveIndexToGCS(
   doc: {
     url: string;
     html: string;
-    json?: unknown;
     statusCode: number;
     error?: string;
     screenshot?: string;
@@ -126,6 +124,7 @@ export async function saveIndexToGCS(
     contentType?: string;
     postprocessorsUsed?: string[];
     proxyUsed?: "basic" | "stealth";
+    firePdfCacheKey?: string;
   },
 ): Promise<void> {
   return await withSpan("firecrawl-index-save-to-gcs", async span => {
@@ -171,7 +170,8 @@ export const useIndex =
   config.INDEX_DATABASE_URL !== "" && config.INDEX_DATABASE_URL !== undefined;
 
 export const useSearchIndex =
-  config.SEARCH_SERVICE_URL !== "" && config.SEARCH_SERVICE_URL !== undefined;
+  searchIndexEnv.SEARCH_SERVICE_URL !== "" &&
+  searchIndexEnv.SEARCH_SERVICE_URL !== undefined;
 
 export function normalizeURLForIndex(url: string): string {
   const urlObj = new URL(url);
@@ -239,11 +239,8 @@ export function generateDomainSplits(
   fakeDomain?: string,
 ): string[] {
   if (fakeDomain) {
-    const parsed = psl.parse(hostname);
-    if (parsed === null) return [fakeDomain];
-
-    const fakeParsed = psl.parse(fakeDomain);
-    if (fakeParsed === null || fakeParsed.domain === null) return [fakeDomain];
+    const fakeParsed = parseHostname(fakeDomain);
+    if (fakeParsed.domain === null) return [fakeDomain];
 
     const subdomains: string[] = (fakeParsed.subdomain ?? "")
       .split(".")
@@ -260,8 +257,12 @@ export function generateDomainSplits(
     return domains;
   }
 
-  const parsed = psl.parse(hostname);
-  if (parsed === null) {
+  const parsed = parseHostname(hostname);
+  // No registrable domain (IP literal, or a single label such as localhost) means
+  // there are no domain splits to generate. Note an unrecognised suffix still
+  // yields one — tldts reports domain.unknown as its own registrable domain.
+  const domain = parsed.domain;
+  if (domain === null) {
     return [];
   }
 
@@ -269,12 +270,12 @@ export function generateDomainSplits(
     .split(".")
     .filter(x => x !== "");
   if (subdomains.length === 1 && subdomains[0] === "www") {
-    return [parsed.domain];
+    return [domain];
   }
 
   const domains: string[] = [];
   for (let i = subdomains.length; i >= 0; i--) {
-    domains.push(subdomains.slice(i).concat([parsed.domain]).join("."));
+    domains.push(subdomains.slice(i).concat([domain]).join("."));
   }
 
   return domains;
@@ -387,6 +388,7 @@ export async function getIndexInsertQueueLength(): Promise<number> {
 const OMCE_JOB_QUEUE_KEY = "omce-job-queue";
 const OMCE_JOB_QUEUE_BATCH_SIZE = 100;
 
+/** @public Unused while OMCE job inserts are disabled. */
 export async function addOMCEJob(data: [number, Buffer]) {
   await redisEvictConnection.sadd(OMCE_JOB_QUEUE_KEY, JSON.stringify(data));
 }
@@ -402,6 +404,7 @@ async function getOMCEJobs(): Promise<[number, Buffer][]> {
     .filter((x): x is [number, Buffer] => x !== undefined);
 }
 
+/** @public Unused while OMCE job inserts are disabled. */
 export async function processOMCEJobs() {
   const jobs = await getOMCEJobs();
   if (jobs.length === 0) {
@@ -469,39 +472,6 @@ export async function queryIndexAtSplitLevel(
   }
 }
 
-export async function queryIndexAtDomainSplitLevel(
-  hostname: string,
-  limit: number,
-  maxAge = 2 * 24 * 60 * 60 * 1000,
-): Promise<string[]> {
-  if (!useIndex || config.FIRECRAWL_INDEX_WRITE_ONLY) {
-    return [];
-  }
-
-  const domainSplitsHash = generateDomainSplits(hostname).map(x => hashURL(x));
-
-  const level = domainSplitsHash.length - 1;
-  if (domainSplitsHash.length === 0) {
-    return [];
-  }
-
-  // Raw SQL returns the full result set (no PostgREST 1000-row cap), so the
-  // previous .range() pagination loop is no longer needed.
-  try {
-    const data = await rpcQueryIndexAtDomainSplitLevel(
-      level,
-      domainSplitsHash[level],
-      new Date(Date.now() - maxAge).toISOString(),
-    );
-    const links = new Set<string>();
-    data.forEach(x => links.add(x.resolved_url));
-    return [...links].slice(0, limit);
-  } catch (error) {
-    _logger.warn("Error querying index", { error, hostname, limit });
-    return [];
-  }
-}
-
 export async function queryOMCESignatures(
   hostname: string,
   maxAge = 2 * 24 * 60 * 60 * 1000,
@@ -526,43 +496,6 @@ export async function queryOMCESignatures(
   } catch (error) {
     _logger.warn("Error querying index (omce)", { error, hostname });
     return [];
-  }
-}
-
-export async function queryEngpickerVerdict(
-  hostname: string,
-): Promise<"TlsClientOk" | "ChromeCdpRequired" | "Uncertain" | "Unknown"> {
-  if (!useIndex || config.FIRECRAWL_INDEX_WRITE_ONLY) {
-    return "Unknown";
-  }
-
-  const domainSplitsHash = generateDomainSplits(hostname).map(x => hashURL(x));
-
-  const level = domainSplitsHash.length - 1;
-  if (domainSplitsHash.length === 0) {
-    return "Unknown";
-  }
-
-  // 250ms max time taken
-  try {
-    const data = await Promise.race([
-      rpcQueryEngpickerVerdict(domainSplitsHash[level]),
-      new Promise<{ verdict: string }[]>(resolve =>
-        setTimeout(() => resolve([{ verdict: "Unknown" }]), 250),
-      ),
-    ]);
-
-    return (data?.[0]?.verdict ?? "Unknown") as
-      | "TlsClientOk"
-      | "ChromeCdpRequired"
-      | "Uncertain"
-      | "Unknown";
-  } catch (error) {
-    _logger.warn("Error querying index (engpicker)", {
-      error,
-      hostname,
-    });
-    return "Unknown";
   }
 }
 

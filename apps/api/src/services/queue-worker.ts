@@ -1,8 +1,6 @@
 import "dotenv/config";
 import { config } from "../config";
-import "./sentry";
-import { setSentryServiceTag } from "./sentry";
-import * as Sentry from "@sentry/node";
+import { shutdownTracing } from "../otel";
 import {
   getDeepResearchQueue,
   getGenerateLlmsTxtQueue,
@@ -19,12 +17,11 @@ import { performGenerateLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt
 import { updateGeneratedLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt-redis";
 import Express from "express";
 import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
-import { initializeBlocklist } from "../scraper/WebScraper/utils/blocklist";
+import { service } from "../service";
 import { initializeEngineForcing } from "../scraper/WebScraper/utils/engine-forcing";
 import { crawlFinishedQueue, NuQJob, scrapeQueue } from "./worker/nuq";
 import { finishCrawlSuper } from "./worker/crawl-logic";
 import { getCrawl } from "../lib/crawl-redis";
-import { TransportableError } from "../lib/error";
 import {
   processMonitorCheckJob,
   reconcileRunningMonitorChecks,
@@ -34,6 +31,9 @@ import {
   consumeMonitorCheckJobs,
   consumeMonitorSearchCheckJobs,
 } from "./monitoring/queue";
+import { shutdownPubSubLogging } from "./logging/log_job";
+import { startRole } from "../main";
+import { runProcessStop } from "../service/service";
 
 configDotenv();
 
@@ -83,6 +83,7 @@ const processDeepResearchJobInternal = async (
       formats: job.data.request.formats,
       jsonOptions: job.data.request.jsonOptions,
       apiKeyId: job.data.apiKeyId,
+      externalRequestId: job.data.externalRequestId ?? null,
     });
 
     if (result.success) {
@@ -100,15 +101,6 @@ const processDeepResearchJobInternal = async (
     }
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
-
-    // Skip TransportableErrors: they're flow control, not failures.
-    if (!(error instanceof TransportableError)) {
-      Sentry.captureException(error, {
-        data: {
-          job: job.id,
-        },
-      });
-    }
 
     try {
       await job.moveToFailed(error, token, false);
@@ -153,6 +145,7 @@ const processGenerateLlmsTxtJobInternal = async (
       showFullText: job.data.request.showFullText,
       cache: job.data.request.cache,
       apiKeyId: job.data.apiKeyId,
+      externalRequestId: job.data.externalRequestId ?? null,
     });
 
     if (result.success) {
@@ -176,15 +169,6 @@ const processGenerateLlmsTxtJobInternal = async (
     }
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
-
-    // Skip TransportableErrors: they're flow control, not failures.
-    if (!(error instanceof TransportableError)) {
-      Sentry.captureException(error, {
-        data: {
-          job: job.id,
-        },
-      });
-    }
 
     try {
       await job.moveToFailed(error, token, false);
@@ -235,18 +219,6 @@ async function processFinishCrawlJobInternal(_job: NuQJob) {
 
 let isShuttingDown = false;
 let isWorkerStalled = false;
-
-if (require.main === module) {
-  process.on("SIGINT", () => {
-    _logger.debug("Received SIGINT. Shutting down gracefully...");
-    isShuttingDown = true;
-  });
-
-  process.on("SIGTERM", () => {
-    _logger.debug("Received SIGTERM. Shutting down gracefully...");
-    isShuttingDown = true;
-  });
-}
 
 let cantAcceptConnectionCount = 0;
 
@@ -454,10 +426,18 @@ app.listen(workerPort, (error?: Error) => {
   _logger.info(`Liveness endpoint is running on port ${workerPort}`);
 });
 
-(async () => {
-  setSentryServiceTag("queue-worker");
+export async function start() {
+  process.on("SIGINT", () => {
+    _logger.debug("Received SIGINT. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
 
-  await initializeBlocklist().catch(e => {
+  process.on("SIGTERM", () => {
+    _logger.debug("Received SIGTERM. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
+
+  await service.modules.blocklist.init().catch(e => {
     _logger.error("Failed to initialize blocklist", { error: e });
     process.exit(1);
   });
@@ -512,5 +492,15 @@ app.listen(workerPort, (error?: Error) => {
   }
 
   _logger.info("All jobs finished. Shutting down...");
+  try {
+    await shutdownPubSubLogging();
+  } finally {
+    await runProcessStop("queue-worker");
+  }
+  await shutdownTracing();
   process.exit(0);
-})();
+}
+
+if (require.main === module) {
+  void startRole("queue-worker");
+}

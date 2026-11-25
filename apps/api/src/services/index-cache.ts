@@ -2,6 +2,7 @@ import crypto from "crypto";
 import IORedis from "ioredis";
 import { config } from "../config";
 import { logger as _logger } from "../lib/logger";
+import { reportPipelineError } from "../lib/redis-pipeline";
 import {
   indexCacheErrorCounter,
   indexCacheReadDuration,
@@ -9,17 +10,14 @@ import {
 import type { Logger } from "winston";
 
 // Dragonfly LRU cache in front of the index database's URL->id lookup hot
-// path (index_get_recent_5) and the per-domain max age lookup (query_max_age).
-// The instance runs with --cache_mode=true, so memory pressure evicts cold
-// keys; TTLs here are hygiene, not correctness. Invalidation of index entries
-// (invalidated_at) is a rare manual ops action handled by flushing the whole
-// instance.
+// path (index_get_recent_5). The instance runs with --cache_mode=true, so
+// memory pressure evicts cold keys; TTLs here are hygiene, not correctness.
+// Invalidation of index entries (invalidated_at) is a rare manual ops action
+// handled by flushing the whole instance.
 
 const ENTRY_KEY_PREFIX = "idxc:";
 const NEG_KEY_PREFIX = "idxcneg:";
-const MAX_AGE_KEY_PREFIX = "idxma:";
 const ENTRY_TTL_SECONDS = 7 * 24 * 60 * 60;
-const MAX_AGE_TTL_SECONDS = 15 * 60;
 // More entries than index_get_recent_5's LIMIT 5 so that client-side
 // filtering on screenshot/waitFor/minAge still has headroom to find 5 rows.
 const ENTRY_CAP = 32;
@@ -222,6 +220,23 @@ export async function upsertCachedIndexEntries(
     pipeline.del(negKeyFor(key));
     pipeline.hlen(key);
     const results = await pipeline.exec();
+    reportPipelineError(results, logger, {
+      module: "index-cache",
+      method: "upsertCachedIndexEntries",
+      key,
+    });
+
+    // If invalidating the negative marker failed, a surviving marker
+    // would falsely keep proving "nothing inserted since" — retry the DEL
+    // on its own. This is unconditional because deleting the marker is
+    // always safe (it only costs a DB read on the next lookup), and a
+    // connection failure can report the HSET as failed even when Redis
+    // applied it. A throw here is caught below and logged as a write
+    // failure.
+    if (results?.[2]?.[0]) {
+      await client.del(negKeyFor(key));
+    }
+
     const hlen = results?.[3]?.[1];
     if (typeof hlen === "number" && hlen > ENTRY_CAP) {
       const raw = await client.hgetall(key);
@@ -270,64 +285,6 @@ export async function deleteCachedIndexEntry(
       error,
       key,
       id,
-    });
-  }
-}
-
-// Caches query_max_age results per domain hash, including the "no signature"
-// (null) result so absent domains don't keep hitting Postgres.
-export async function getCachedMaxAge(
-  domainHash: Buffer,
-  logger: Logger = _logger,
-  client: IORedis | null = indexCacheRedis,
-): Promise<{ maxAge: number | null } | null> {
-  if (client === null) {
-    return null;
-  }
-  try {
-    const raw = await withTimeout(
-      client.get(MAX_AGE_KEY_PREFIX + domainHash.toString("hex")),
-      READ_TIMEOUT_MS,
-    );
-    if (raw === TIMED_OUT) {
-      indexCacheErrorCounter.inc({ op: "maxage_read_timeout" });
-      return null;
-    }
-    if (raw === null || raw === undefined) {
-      return null;
-    }
-    return { maxAge: JSON.parse(raw).max_age ?? null };
-  } catch (error) {
-    indexCacheErrorCounter.inc({ op: "maxage_read" });
-    logger.warn("Index cache max age read failed", {
-      module: "index-cache",
-      error,
-    });
-    return null;
-  }
-}
-
-export async function setCachedMaxAge(
-  domainHash: Buffer,
-  maxAge: number | null,
-  logger: Logger = _logger,
-  client: IORedis | null = indexCacheRedis,
-): Promise<void> {
-  if (client === null) {
-    return;
-  }
-  try {
-    await client.set(
-      MAX_AGE_KEY_PREFIX + domainHash.toString("hex"),
-      JSON.stringify({ max_age: maxAge }),
-      "EX",
-      MAX_AGE_TTL_SECONDS,
-    );
-  } catch (error) {
-    indexCacheErrorCounter.inc({ op: "maxage_write" });
-    logger.warn("Index cache max age write failed", {
-      module: "index-cache",
-      error,
     });
   }
 }

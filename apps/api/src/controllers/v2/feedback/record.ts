@@ -1,20 +1,31 @@
 import { v7 as uuidv7 } from "uuid";
 import { config } from "../../../config";
+import { feedbackEnv } from "../../../lib/feedback-env";
+import { feedbackTrace } from "../../../lib/feedback-trace";
 import { logger as _logger } from "../../../lib/logger";
+import {
+  withSpan,
+  setSpanAttributes,
+  recordSpanException,
+  type Span,
+} from "../../../lib/otel-tracer";
+import { getScrapeZDR, getSearchZDR } from "../../../lib/zdr-helpers";
 import {
   autumnService,
   featureIdForBillingEndpoint,
 } from "../../../services/autumn/autumn.service";
-import { captureExceptionWithZdrCheck } from "../../../services/sentry";
 import {
   EndpointFeedbackErrorCode,
   RequestWithAuth,
   SearchFeedbackErrorCode,
 } from "../types";
 import {
+  type FeedbackWrite,
   findExistingFeedback,
   insertFeedback,
   lookupFeedbackJob,
+  lookupSessionFeedbackJob,
+  overwriteFeedback,
   updateFeedbackRefundDetails,
 } from "./feedback-store";
 import {
@@ -23,6 +34,7 @@ import {
   FeedbackRecordOptions,
   FeedbackRecordResult,
   RefundPolicySnapshot,
+  isSessionEndpoint,
 } from "./internal-types";
 import { computeRefundPolicy } from "./refund-policy";
 import { sumCreditsRefundedToday } from "./refund-totals";
@@ -45,7 +57,7 @@ function normalizeFeedbackTeamId(teamId: string): string {
 }
 
 function dailyCapFor(options: FeedbackRecordOptions): number {
-  return options.dailyCapCredits ?? config.FEEDBACK_DAILY_CAP_CREDITS;
+  return options.dailyCapCredits ?? feedbackEnv.FEEDBACK_DAILY_CAP_CREDITS;
 }
 
 function feedbackFailure(
@@ -118,12 +130,14 @@ async function lookupJobWithRetry(
   logger: FeedbackLogger,
 ): Promise<FeedbackJobRow | FeedbackRecordResult> {
   try {
-    let job = await lookupFeedbackJob(
-      options.endpoint,
-      options.jobId,
-      dbTeamId,
-    );
-    if (!job) {
+    let job = isSessionEndpoint(options.endpoint)
+      ? await lookupSessionFeedbackJob(
+          options.endpoint,
+          options.jobId,
+          dbTeamId,
+        )
+      : await lookupFeedbackJob(options.endpoint, options.jobId, dbTeamId);
+    if (!job && !isSessionEndpoint(options.endpoint)) {
       await new Promise(resolve => setTimeout(resolve, LOOKUP_RACE_RETRY_MS));
       job = await lookupFeedbackJob(options.endpoint, options.jobId, dbTeamId);
     }
@@ -156,7 +170,18 @@ function validateJob(
     );
   }
 
-  const maxAgeSec = options.maxAgeSec ?? config.FEEDBACK_MAX_AGE_SEC;
+  if (job.feedback_deadline_ms !== undefined) {
+    if (job.feedback_deadline_ms > Date.now()) return null;
+    const maxAgeSec = options.maxAgeSec ?? feedbackEnv.FEEDBACK_MAX_AGE_SEC;
+    return feedbackFailure(
+      409,
+      "FEEDBACK_WINDOW_EXPIRED",
+      options.windowExpiredMessage ??
+        `Feedback must be submitted within ${maxAgeSec} seconds of the job.`,
+    );
+  }
+
+  const maxAgeSec = options.maxAgeSec ?? feedbackEnv.FEEDBACK_MAX_AGE_SEC;
   const createdAtMs = new Date(job.created_at).getTime();
   if (Number.isNaN(createdAtMs)) {
     logger.warn("Job row had unparseable created_at", {
@@ -201,6 +226,39 @@ async function duplicateEndpointResponse(
   };
 }
 
+/** A session can be rated again: the latest rating replaces the stored one. */
+async function overwriteSessionFeedback(
+  write: FeedbackWrite,
+  logger: FeedbackLogger,
+): Promise<FeedbackRecordResult> {
+  const { id, error } = await overwriteFeedback(write);
+  if (!id) {
+    logger.error("Failed to overwrite session feedback", {
+      errorCode: error?.code,
+    });
+    return feedbackFailure(500, "INTERNAL", "Failed to record feedback.");
+  }
+
+  logger.info("Session feedback overwritten", {
+    feedbackId: id,
+    endpoint: write.options.endpoint,
+    rating: write.options.feedback.rating,
+  });
+  return {
+    status: 200,
+    body: {
+      success: true,
+      feedbackId: id,
+      creditsRefunded: 0,
+      creditsRefundedToday: await sumCreditsRefundedToday(
+        write.dbTeamId,
+        logger,
+      ),
+      dailyRefundCap: dailyCapFor(write.options),
+    },
+  };
+}
+
 async function refundCredits(params: {
   req: RequestWithAuth<any, any, any>;
   options: FeedbackRecordOptions;
@@ -212,10 +270,22 @@ async function refundCredits(params: {
   const { req, options, feedbackId, cappedRefund, policy, logger } = params;
   if (cappedRefund <= 0) return 0;
 
+  const orgId = req.acuc?.org_id ?? null;
+  if (!orgId) {
+    // No org, no Autumn customer to credit back. Reported as refunded anyway,
+    // which is what a refund that could not name its org already did.
+    logger.error("Feedback refund skipped: no org for the team");
+    return cappedRefund;
+  }
+
   try {
     await autumnService.refundCredits({
       teamId: req.auth.team_id,
+      orgId,
       value: cappedRefund,
+      // One refund per feedback record; a retried refund dedupes (firebill
+      // route) instead of crediting twice.
+      idempotencyKey: `fc:refund:feedback:${feedbackId}`,
       featureId:
         options.refundFeatureId ??
         featureIdForBillingEndpoint(options.endpoint),
@@ -235,9 +305,53 @@ async function refundCredits(params: {
   }
 }
 
+/**
+ * Team-level zero data retention for the endpoint the feedback refers to. Unlike
+ * `shouldSkipPersistenceForForcedZdr` this ignores the persistence override:
+ * the trace must stay unrecorded whenever the team is forced into ZDR.
+ */
+function isForcedZdrTeam(
+  req: RequestWithAuth<any, any, any>,
+  options: FeedbackRecordOptions,
+): boolean {
+  if (options.endpoint === "search") {
+    const searchZDR = getSearchZDR(req.acuc?.flags);
+    return searchZDR === "forced-zdr" || searchZDR === "forced-anon";
+  }
+
+  if (
+    options.endpoint === "scrape" ||
+    options.endpoint === "parse" ||
+    isSessionEndpoint(options.endpoint)
+  ) {
+    return getScrapeZDR(req.acuc?.flags) === "forced";
+  }
+
+  return false;
+}
+
 export async function recordEndpointFeedback(
   req: RequestWithAuth<any, any, any>,
   options: FeedbackRecordOptions,
+): Promise<FeedbackRecordResult> {
+  return withSpan(
+    "api.feedback.record",
+    span => recordEndpointFeedbackInner(req, options, span),
+    {
+      attributes: {
+        "feedback.endpoint": options.endpoint,
+        "feedback.job_id": options.jobId,
+        "feedback.team_id": req.auth.team_id,
+      },
+      zeroDataRetention: isForcedZdrTeam(req, options),
+    },
+  );
+}
+
+async function recordEndpointFeedbackInner(
+  req: RequestWithAuth<any, any, any>,
+  options: FeedbackRecordOptions,
+  span: Span,
 ): Promise<FeedbackRecordResult> {
   const logger = _logger.child({
     module: "api/v2",
@@ -249,6 +363,7 @@ export async function recordEndpointFeedback(
 
   if (shouldSkipPersistenceForForcedZdr(req, options)) {
     logger.info("Skipping feedback persistence for forced ZDR team");
+    setSpanAttributes(span, { "feedback.zero_data_retention": true });
     return zdrFeedbackSuccess(options);
   }
 
@@ -262,7 +377,9 @@ export async function recordEndpointFeedback(
     if ("status" in jobOrFailure) return jobOrFailure;
 
     if (shouldSkipPersistenceForJobZdr(jobOrFailure, options)) {
+      // Learned late: the attribute drops this span and flags the trace.
       logger.info("Skipping feedback persistence for ZDR job");
+      setSpanAttributes(span, { "feedback.zero_data_retention": true });
       return zdrFeedbackSuccess(options);
     }
 
@@ -270,17 +387,23 @@ export async function recordEndpointFeedback(
     if (jobFailure) return jobFailure;
 
     const feedbackId = uuidv7();
-    const insertErr = await insertFeedback({
-      feedbackId,
+    const write = {
       options,
       job: jobOrFailure,
       dbTeamId,
+      trace: feedbackTrace(req),
+    };
+    const insertErr = await insertFeedback({
+      ...write,
+      feedbackId,
       apiKeyId: req.acuc?.api_key_id ?? null,
     });
 
     if (insertErr) {
       if (insertErr.code === POSTGRES_UNIQUE_VIOLATION) {
-        return await duplicateEndpointResponse(options, dbTeamId, logger);
+        return isSessionEndpoint(options.endpoint)
+          ? await overwriteSessionFeedback(write, logger)
+          : await duplicateEndpointResponse(options, dbTeamId, logger);
       }
 
       logger.error("Failed to insert endpoint feedback", { error: insertErr });
@@ -362,10 +485,10 @@ export async function recordEndpointFeedback(
       },
     };
   } catch (error) {
-    captureExceptionWithZdrCheck(error);
     logger.error("Unhandled error while recording endpoint feedback", {
       error,
     });
+    recordSpanException(span, error);
     return feedbackFailure(
       500,
       "INTERNAL",

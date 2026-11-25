@@ -11,6 +11,115 @@ import { judgeCreditsForJudgedCount } from "./search/billing";
 import type { MonitorTarget } from "./types";
 
 describe("monitoring store credit helpers", () => {
+  describe("reserving credits using previous PDF results", () => {
+    const target: MonitorTarget = {
+      id: "crawl-target",
+      type: "crawl",
+      url: "https://example.com",
+      crawlOptions: { limit: 69 },
+      scrapeOptions: {},
+    };
+    const page = (
+      numPages: unknown,
+      url = "https://example.com/document.pdf",
+    ) => ({
+      target_id: target.id,
+      url,
+      metadata: { numPages },
+    });
+
+    it("covers the 905 PDF pages from the parked 943-credit monitor run", () => {
+      const pdfPageCounts = [
+        2, 103, 22, 328, 50, 2, 133, 84, 60, 1, 3, 3, 55, 4, 5, 2, 2, 3, 2, 2,
+        1, 1, 1, 2, 10, 1, 2, 2, 2, 1, 9, 2, 2, 3,
+      ];
+      // 69 URL credits + 69 judge allowance + 871 additional PDF pages.
+      expect(estimateMonitorCreditsPerRun([target], true)).toBe(138);
+      expect(
+        estimateMonitorCreditsPerRun(
+          [target],
+          true,
+          pdfPageCounts.map(n => page(n)),
+        ),
+      ).toBe(1009);
+    });
+
+    it("keeps the current option costs and allowance for undiscovered URLs", () => {
+      const jsonTarget = {
+        ...target,
+        scrapeOptions: { formats: [{ type: "json" }] },
+      } as MonitorTarget;
+      expect(
+        estimateMonitorCreditsPerRun([jsonTarget], true, [page(100)]),
+      ).toBe(69 * 6 + 99);
+    });
+
+    it("ignores saved pages for removed targets and removed scrape URLs", () => {
+      const scrape: MonitorTarget = {
+        id: target.id,
+        type: "scrape",
+        urls: ["https://example.com/current.pdf"],
+        scrapeOptions: {},
+      };
+      expect(
+        estimateMonitorCreditsPerRun([scrape], false, [
+          page(100),
+          { ...page(200, scrape.urls[0]), target_id: "old-target" },
+          page(10, scrape.urls[0]),
+        ]),
+      ).toBe(10);
+    });
+
+    it("respects the current PDF maxPages limit", () => {
+      const capped = {
+        ...target,
+        scrapeOptions: { parsers: [{ type: "pdf", maxPages: 5 }] },
+      } as MonitorTarget;
+      expect(estimateMonitorCreditsPerRun([capped], false, [page(100)])).toBe(
+        73,
+      );
+    });
+
+    it("does not reserve PDF costs when parsing is disabled", () => {
+      const unparsed = {
+        ...target,
+        scrapeOptions: { parsers: [] },
+      } as MonitorTarget;
+      expect(estimateMonitorCreditsPerRun([unparsed], true, [page(100)])).toBe(
+        138,
+      );
+    });
+
+    it("caps historical PDF URLs to a reduced crawl limit conservatively", () => {
+      const smaller = {
+        ...target,
+        crawlOptions: { limit: 1 },
+      } as MonitorTarget;
+      expect(
+        estimateMonitorCreditsPerRun([smaller], true, [page(10), page(100)]),
+      ).toBe(101);
+    });
+
+    it("includes redaction costs for each additional PDF page", () => {
+      const redacted = {
+        ...target,
+        scrapeOptions: { redactPII: true },
+      } as MonitorTarget;
+      expect(estimateMonitorCreditsPerRun([redacted], false, [page(10)])).toBe(
+        69 + 9 * 5,
+      );
+    });
+
+    it.each([null, undefined, "100", NaN, Infinity, -1, 0, 1.5])(
+      "preserves the baseline for invalid or missing historical page count %s",
+      numPages => {
+        expect(
+          estimateMonitorCreditsPerRun([target], true, [page(numPages)]),
+        ).toBe(138);
+      },
+    );
+  });
+
   it("estimates goal-enabled scrape monitors from scrape option costs", () => {
     const targets: MonitorTarget[] = [
       {
@@ -24,8 +133,9 @@ describe("monitoring store credit helpers", () => {
       },
     ];
 
-    expect(estimateMonitorCreditsPerRun(targets, false)).toBe(18);
-    expect(estimateMonitorCreditsPerRun(targets, true)).toBe(20);
+    // 2 URLs x 5 (json change tracking). Enhanced proxies add nothing.
+    expect(estimateMonitorCreditsPerRun(targets, false)).toBe(10);
+    expect(estimateMonitorCreditsPerRun(targets, true)).toBe(12);
   });
 
   it("adds predictable lockdown costs and judge credits separately", () => {
@@ -42,6 +152,56 @@ describe("monitoring store credit helpers", () => {
 
     expect(estimateMonitorCreditsPerRun(targets, false)).toBe(5);
     expect(estimateMonitorCreditsPerRun(targets, true)).toBe(6);
+  });
+
+  it("keeps the lockdown cost on a json monitor", () => {
+    const targets: MonitorTarget[] = [
+      {
+        id: "target-1",
+        type: "scrape",
+        urls: ["https://example.com/a"],
+        scrapeOptions: {
+          lockdown: true,
+          formats: [{ type: "json", schema: {} }],
+        },
+      },
+    ];
+
+    // 1 base + 4 lockdown + 4 json.
+    expect(estimateMonitorCreditsPerRun(targets, false)).toBe(9);
+  });
+
+  it("estimates the prompt injection guard cost on a json monitor", () => {
+    const targets: MonitorTarget[] = [
+      {
+        id: "target-1",
+        type: "scrape",
+        urls: ["https://example.com/a"],
+        scrapeOptions: {
+          formats: [{ type: "json", schema: {}, checkPromptInjection: true }],
+        },
+      },
+    ];
+
+    // 1 base + 4 json + 4 prompt injection guard.
+    expect(estimateMonitorCreditsPerRun(targets, false)).toBe(9);
+  });
+
+  it("estimates the top-level prompt injection guard on a markdown monitor", () => {
+    const targets: MonitorTarget[] = [
+      {
+        id: "target-1",
+        type: "scrape",
+        urls: ["https://example.com/a"],
+        scrapeOptions: {
+          formats: ["markdown"],
+          checkPromptInjection: true,
+        },
+      },
+    ];
+
+    // 1 base + 4 prompt injection guard.
+    expect(estimateMonitorCreditsPerRun(targets, false)).toBe(5);
   });
 
   it("uses target options when page rows do not have recorded scrape credits", () => {
@@ -69,7 +229,7 @@ describe("monitoring store credit helpers", () => {
         ],
         targets,
       ),
-    ).toBe(10);
+    ).toBe(6);
   });
 
   it("uses monitor metadata for fallback PDF credits when recorded usage is missing", () => {
@@ -96,34 +256,7 @@ describe("monitoring store credit helpers", () => {
     ).toBe(5);
   });
 
-  it("uses monitor metadata for fallback proxy and postprocessor credits", () => {
-    const targets: MonitorTarget[] = [
-      {
-        id: "target-1",
-        type: "scrape",
-        urls: ["https://x.com/firecrawl"],
-        scrapeOptions: {},
-      },
-    ];
-
-    expect(
-      calculateMonitorCheckActualCreditsFromPages(
-        [
-          {
-            target_id: "target-1",
-            metadata: {
-              proxyUsed: "stealth",
-              postprocessorsUsed: ["x-twitter"],
-            },
-            status: "same",
-          },
-        ],
-        targets,
-      ),
-    ).toBe(34);
-  });
-
-  it("treats enhanced proxy metadata as premium for fallback billing", () => {
+  it("does not bill extra when enhanced proxy metadata is present", () => {
     const targets: MonitorTarget[] = [
       {
         id: "target-1",
@@ -146,10 +279,10 @@ describe("monitoring store credit helpers", () => {
         ],
         targets,
       ),
-    ).toBe(5);
+    ).toBe(1);
   });
 
-  it("does not add fallback proxy credits when runtime metadata says basic was used", () => {
+  it("bills json and extra PDF pages in fallback billing, whatever proxy ran", () => {
     const targets: MonitorTarget[] = [
       {
         id: "target-1",
@@ -342,7 +475,7 @@ describe("FLAT deterministic search-monitor billing", () => {
 
     it("a still-running search (no credits stamped yet) sums to 0 — the reconciler must NOT finalize here", () => {
       // Pre-stamp shape the dispatcher writes before the inline search finishes.
-      // The never-zero guarantee relies on isMonitorCheckComplete refusing to
+      // The never-zero guarantee relies on findUnfinishedMonitorTarget refusing to
       // finalize a run whose searchCompleted flag is not yet true (see runner.ts).
       const pending = { targetId: "search-1", type: "search" as const };
       expect((pending as any).searchCompleted).toBeUndefined();

@@ -31,14 +31,16 @@ export type AuthCreditUsageChunkRow = Record<string, any> & {
 export async function authCreditUsageChunk(
   database: DB,
   input_key: string,
+  input_credential_purpose: "general" | "hosted_mcp_oauth" = "general",
 ): Promise<AuthCreditUsageChunkRow[]> {
   const rows = await execRows<AuthCreditUsageChunkRow>(
     database,
-    sql`select * from auth_credit_usage_chunk_56(input_key => ${input_key})`,
+    sql`select * from auth_chunk_2(input_key => ${input_key}, input_credential_purpose => ${input_credential_purpose})`,
   );
   // api_key_id is a bigint column, so the pg driver hands it back as a string.
   for (const row of rows) {
     if (row.api_key_id != null) {
+      row.api_key_id_text = String(row.api_key_id);
       row.api_key_id = toNum(row.api_key_id);
     }
   }
@@ -51,16 +53,7 @@ export function authCreditUsageChunkFromTeam(
 ): Promise<AuthCreditUsageChunkRow[]> {
   return execRows(
     database,
-    sql`select * from auth_credit_usage_chunk_56_from_team(input_team => ${input_team})`,
-  );
-}
-
-export function getAgentFreeRequestsLeft(
-  i_team_id: string,
-): Promise<{ free_requests_left: number }[]> {
-  return execRows(
-    db,
-    sql`select * from get_agent_free_requests_left(i_team_id => ${i_team_id})`,
+    sql`select * from auth_chunk_2_from_team(input_team => ${input_team})`,
   );
 }
 
@@ -70,60 +63,6 @@ export function agentConsumeFreeRequestIfLeft(
   return execRows(
     db,
     sql`select * from agent_consume_free_request_if_left(i_team_id => ${i_team_id})`,
-  );
-}
-
-export function billTeam7(params: {
-  team_id: string;
-  subscription_id: string | null;
-  credits: number;
-  api_key_id: number | null;
-  is_extract: boolean;
-}): Promise<{ api_key: string }[]> {
-  return execRows(
-    db,
-    sql`select * from bill_team_7(_team_id => ${params.team_id}, sub_id => ${params.subscription_id}, credits => ${params.credits}, i_api_key_id => ${params.api_key_id}, is_extract_param => ${params.is_extract})`,
-  );
-}
-
-export async function changeTrackingInsertScrape(params: {
-  team_id: string;
-  url: string;
-  job_id: string;
-  change_tracking_tag: string | null;
-  date_added: string;
-}): Promise<void> {
-  await db.execute(
-    sql`select change_tracking_insert_scrape(p_team_id => ${params.team_id}, p_url => ${params.url}, p_job_id => ${params.job_id}, p_change_tracking_tag => ${params.change_tracking_tag}, p_date_added => ${params.date_added}::timestamptz)`,
-  );
-}
-
-export function creditsBilledByCrawlId(
-  i_crawl_id: string,
-): Promise<{ credits_billed: number }[]> {
-  return execRows(
-    db,
-    sql`select * from credits_billed_by_crawl_id_2(i_crawl_id => ${i_crawl_id})`,
-  );
-}
-
-export function diffGetLastScrape(
-  i_team_id: string,
-  i_url: string,
-  i_tag: string | null,
-): Promise<{ o_job_id: string; o_date_added: string }[]> {
-  return execRows(
-    db,
-    sql`select * from diff_get_last_scrape_v7(i_team_id => ${i_team_id}, i_url => ${i_url}, i_tag => ${i_tag})`,
-  );
-}
-
-export function getZdrCleanupBatch(
-  p_limit: number,
-): Promise<{ request_id: string; ids: string[] }[]> {
-  return execRows(
-    db,
-    sql`select * from get_zdr_cleanup_batch_2(p_limit => ${p_limit})`,
   );
 }
 
@@ -162,17 +101,6 @@ export function queryIndexAtSplitLevel(
   );
 }
 
-export function queryIndexAtDomainSplitLevel(
-  i_level: number,
-  i_domain_hash: Buffer,
-  i_newer_than: string,
-): Promise<{ resolved_url: string }[]> {
-  return execRows(
-    dbIndex,
-    sql`select * from query_index_at_domain_split_level(i_level => ${i_level}, i_domain_hash => ${i_domain_hash}, i_newer_than => ${i_newer_than}::timestamptz)`,
-  );
-}
-
 export function queryOmceSignatures(
   i_domain_hash: Buffer,
   i_newer_than: string,
@@ -180,15 +108,6 @@ export function queryOmceSignatures(
   return execRows(
     dbIndex,
     sql`select * from query_omce_signatures(i_domain_hash => ${i_domain_hash}, i_newer_than => ${i_newer_than}::timestamptz)`,
-  );
-}
-
-export function queryEngpickerVerdict(
-  i_domain_hash: Buffer,
-): Promise<{ verdict: string }[]> {
-  return execRows(
-    dbIndex,
-    sql`select * from query_engpicker_verdict(i_domain_hash => ${i_domain_hash})`,
   );
 }
 
@@ -227,27 +146,6 @@ export function queryDomainPriority(
   return execRows(
     dbIndex,
     sql`select * from query_domain_priority(p_min_total => ${p_min_total}, p_min_priority => ${p_min_priority}, p_lim => ${p_lim}, p_time => ${p_time}::timestamptz)`,
-  );
-}
-
-export function queryIndexAtDomainSplitLevelOmce<T = Record<string, any>>(
-  i_level: number,
-  i_domain_hash: Buffer,
-  i_newer_than: string,
-  limit?: number,
-): Promise<T[]> {
-  return execRows(
-    dbIndex,
-    sql`select * from query_index_at_domain_split_level_omce(i_level => ${i_level}, i_domain_hash => ${i_domain_hash}, i_newer_than => ${i_newer_than}::timestamptz)${limit !== undefined ? sql` limit ${limit}` : sql``}`,
-  );
-}
-
-export function queryMaxAge(
-  i_domain_hash: Buffer,
-): Promise<{ max_age: number | null }[]> {
-  return execRows(
-    dbIndex,
-    sql`select * from query_max_age(i_domain_hash => ${i_domain_hash})`,
   );
 }
 

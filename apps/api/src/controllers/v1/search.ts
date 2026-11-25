@@ -1,5 +1,6 @@
 import { Response } from "express";
 import { config } from "../../config";
+import { timingSafeSecretEqual } from "../../lib/secret-compare";
 import {
   Document,
   RequestWithAuth,
@@ -10,6 +11,7 @@ import {
 import { billTeam } from "../../services/billing/credit_billing";
 import { v7 as uuidv7 } from "uuid";
 import { logSearch, logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { search } from "../../search";
 import { logger as _logger } from "../../lib/logger";
 import {
@@ -19,10 +21,18 @@ import {
 } from "../../lib/key-restriction";
 import type { Logger } from "winston";
 import { ScrapeJobTimeoutError } from "../../lib/error";
-import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { z } from "zod";
 import { executeSearch } from "../../search/execute";
+import { applySearchPlanHook } from "../../search/plan-hook";
+import { requestContext } from "../../lib/request-context";
+import { installedService } from "../../service/service";
+import type { SearchRequest as ServiceSearchRequest } from "../../service/request";
 import { resolveThreatProtection } from "../../lib/threat-protection/request";
+import {
+  resolveSafeMode,
+  getEffectiveSearchForcedKind,
+} from "../../lib/safe-mode";
+import { checkPermissions, ipWhitelistRefusal } from "../../lib/permissions";
 import {
   DocumentWithCostTracking,
   scrapeSearchResults,
@@ -32,15 +42,22 @@ import {
   filterDocumentsWithContent,
 } from "../../search/transform";
 import { fromV1ScrapeOptions } from "../v2/types";
-import { getSearchForcedKind } from "../../lib/zdr-helpers";
 import {
-  KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   adjustKeylessCredits,
+  keylessLimitBody,
+  keylessProviderToolsBody,
   logKeylessCreditUsage,
   reserveKeylessCredits,
 } from "../../lib/keyless";
 import { projectSearchTotalCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import { isUsOnly, usOnlyLocationRefusal } from "../../lib/us-only";
+import { isSelfHosted } from "../../lib/deployment";
+import { teamPlanClass } from "../../lib/team-plan-class";
+import { UsOnlyUnavailableError } from "../../scraper/scrapeURL/error";
+
+const IMAGE_SEARCH_US_ONLY_MESSAGE =
+  "Image search is not available for teams restricted to US-only processing.";
 
 // Used for deep research
 export async function searchAndScrapeSearchResult(
@@ -58,10 +75,13 @@ export async function searchAndScrapeSearchResult(
   flags: any,
 ): Promise<DocumentWithCostTracking[]> {
   try {
+    const forcedKind = getEffectiveSearchForcedKind(flags, undefined);
     const searchResults = await search({
       query,
       logger,
       num_results: 5,
+      usOnly: isUsOnly(flags),
+      enterprise: forcedKind ? [forcedKind] : undefined,
     });
 
     const { scrapeOptions } = fromV1ScrapeOptions(
@@ -102,7 +122,12 @@ export async function searchController(
   const controllerStartTime = new Date().getTime();
 
   const jobId = uuidv7();
-  const teamForcedKind = getSearchForcedKind(req.acuc?.flags);
+  // Safe Mode lockdown forces the "zdr" kind like the searchZDR flag does
+  // (see getEffectiveSearchForcedKind).
+  const teamForcedKind = getEffectiveSearchForcedKind(
+    req.acuc?.flags,
+    req.body.scrapeOptions?.safeMode,
+  );
   const zeroDataRetention = teamForcedKind !== null;
   const teamEnterprise = teamForcedKind ? [teamForcedKind] : undefined;
   let logger = _logger.child({
@@ -121,9 +146,10 @@ export async function searchController(
     id: jobId,
   };
   const middlewareTime = controllerStartTime - middlewareStartTime;
-  const isSearchPreview =
-    config.SEARCH_PREVIEW_TOKEN !== undefined &&
-    config.SEARCH_PREVIEW_TOKEN === req.body.__searchPreviewToken;
+  const isSearchPreview = timingSafeSecretEqual(
+    req.body.__searchPreviewToken,
+    config.SEARCH_PREVIEW_TOKEN,
+  );
   let reservedKeylessCredits = 0;
   let reconciledKeylessCredits = false;
 
@@ -154,6 +180,21 @@ export async function searchController(
       origin: req.body.origin,
     });
 
+    // Safe Mode: validate the per-request param up front and reject scrape
+    // options it forbids (the worker backstop would otherwise strip them
+    // silently). Domain controls force threat protection over the results.
+    const safeMode = resolveSafeMode(
+      req.acuc?.flags,
+      req.body.scrapeOptions?.safeMode,
+    );
+    if (safeMode.error) {
+      return res.status(403).json({
+        success: false,
+        code: safeMode.code,
+        error: safeMode.error,
+      });
+    }
+
     // Threat protection: resolve the effective policy. Blocked domains are
     // removed from search results entirely.
     const threatProtection = await resolveThreatProtection({
@@ -162,6 +203,7 @@ export async function searchController(
       flags: req.acuc?.flags ?? null,
       override:
         req.body.threatProtection ?? req.body.scrapeOptions?.threatProtection,
+      force: safeMode.safeMode?.domainControls === true,
     });
     if (threatProtection.error) {
       return res.status(403).json({
@@ -170,10 +212,66 @@ export async function searchController(
       });
     }
 
+    const usOnlyLocationError =
+      requestedFormats.length > 0
+        ? usOnlyLocationRefusal(
+            req.acuc?.flags,
+            req.body.scrapeOptions?.location?.country,
+            req.body.scrapeOptions?.geolocation?.country,
+          )
+        : undefined;
+    if (usOnlyLocationError) {
+      return res.status(403).json({
+        success: false,
+        code: "US_ONLY_UNAVAILABLE",
+        error: usOnlyLocationError,
+      });
+    }
+
+    const ipWhitelistError =
+      requestedFormats.length > 0
+        ? ipWhitelistRefusal(
+            req.acuc?.flags,
+            req.body.scrapeOptions?.location?.country,
+            req.body.scrapeOptions?.geolocation?.country,
+          )
+        : undefined;
+    if (ipWhitelistError) {
+      return res.status(403).json({
+        success: false,
+        error: ipWhitelistError,
+      });
+    }
+
+    // Search only scrapes (and only honors scrapeOptions) when formats are
+    // requested, so the scrape-option checks apply only then.
+    if (
+      safeMode.safeMode &&
+      requestedFormats.length > 0 &&
+      req.body.scrapeOptions
+    ) {
+      const permissions = checkPermissions(
+        req.body.scrapeOptions,
+        req.acuc?.flags,
+        {
+          threatProtectionOrgConfig: threatProtection.orgConfig,
+          safeMode: safeMode.safeMode,
+        },
+      );
+      if (permissions.error) {
+        return res.status(403).json({
+          success: false,
+          code: permissions.code,
+          error: permissions.error,
+        });
+      }
+    }
+
     await logRequest({
       id: jobId,
       kind: "search",
       api_version: "v1",
+      external_request_id: externalRequestId(req),
       team_id: req.auth.team_id,
       origin: req.body.origin ?? "api",
       integration: req.body.integration,
@@ -193,10 +291,104 @@ export async function searchController(
     const shouldScrape =
       req.body.scrapeOptions.formats &&
       req.body.scrapeOptions.formats.length > 0;
+    const ctx =
+      req.ctx ??
+      requestContext({
+        teamId: req.auth.team_id,
+        zeroDataRetention,
+        flags: req.acuc?.flags ?? null,
+        orgId: req.acuc?.org_id ?? null,
+        apiKeyId: req.acuc?.api_key_id ?? null,
+      });
+    req.ctx = ctx;
+    const hookBody: ServiceSearchRequest = {
+      query: req.body.query,
+      limit: req.body.limit,
+      tbs: req.body.tbs,
+      filter: req.body.filter,
+      sources: [{ type: "web" }],
+      categories: [],
+      lang: req.body.lang ?? "en",
+      enterprise: teamEnterprise,
+      country: req.body.country,
+      location: req.body.location,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration ?? null,
+      timeout: req.body.timeout,
+      ignoreInvalidURLs: req.body.ignoreInvalidURLs ?? false,
+      asyncScraping: false,
+      toolDetail: "compact",
+      scrapeOptions: shouldScrape ? scrapeOptions : undefined,
+    };
+    const planHooks = installedService()?.hooks;
+    const planned = planHooks?.has("search.plan")
+      ? await applySearchPlanHook(
+          {
+            query: req.body.query,
+            limit: req.body.limit,
+            sources: [{ type: "web" }],
+          },
+          { ctx, body: hookBody },
+        )
+      : {
+          query: req.body.query,
+          limit: req.body.limit,
+          sources: [{ type: "web" }],
+        };
+
+    let usOnlyImagesWarning: string | undefined;
+    if (planHooks?.has("search.plan")) {
+      const plannedWantsTools = planned.sources.some(
+        source => source.type === "alexandria",
+      );
+      const plannedWantsSkills = planned.sources.some(
+        source => source.type === "skills",
+      );
+      if (
+        (plannedWantsTools || plannedWantsSkills) &&
+        req.auth.team_id.startsWith("preview_keyless_")
+      ) {
+        applyAgentAuthDiscoveryHeader(res);
+        return res
+          .status(403)
+          .json(keylessProviderToolsBody(req.auth.team_id, req));
+      }
+      if ((plannedWantsTools || plannedWantsSkills) && !planned.query.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: plannedWantsTools
+            ? "A query is required for tool search."
+            : "A query is required for skill search.",
+        });
+      }
+      if ((plannedWantsTools || plannedWantsSkills) && zeroDataRetention) {
+        return res.status(403).json({
+          success: false,
+          error:
+            "Provider discovery requires access and does not support zero data retention.",
+        });
+      }
+      if (
+        isUsOnly(req.acuc?.flags) &&
+        planned.sources.some(source => source.type === "images")
+      ) {
+        planned.sources = planned.sources.filter(
+          source => source.type !== "images",
+        );
+        if (planned.sources.length === 0) {
+          return res.status(403).json({
+            success: false,
+            code: "US_ONLY_UNAVAILABLE",
+            error: IMAGE_SEARCH_US_ONLY_MESSAGE,
+          });
+        }
+        usOnlyImagesWarning = IMAGE_SEARCH_US_ONLY_MESSAGE;
+      }
+    }
     const projectedKeylessCredits = !isSearchPreview
       ? projectSearchTotalCredits(
           {
-            limit: req.body.limit,
+            limit: planned.limit,
             enterprise: teamEnterprise,
             scrapeOptions: shouldScrape ? scrapeOptions : undefined,
           },
@@ -212,10 +404,9 @@ export async function searchController(
       );
       if (!reservation.ok) {
         applyAgentAuthDiscoveryHeader(res);
-        return res.status(429).json({
-          success: false,
-          error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
-        });
+        return res
+          .status(429)
+          .json(await keylessLimitBody(req.auth.team_id, "v1_search", req));
       }
       reservedKeylessCredits = projectedKeylessCredits;
     }
@@ -223,14 +414,14 @@ export async function searchController(
     // Execute search using v2 logic
     const result = await executeSearch(
       {
-        query: req.body.query,
-        limit: req.body.limit,
+        query: planned.query,
+        limit: planned.limit,
         tbs: req.body.tbs,
         filter: req.body.filter,
         lang: req.body.lang,
         country: req.body.country,
         location: req.body.location,
-        sources: [{ type: "web" }], // v1 only supports web
+        sources: planned.sources, // v1 defaults to web
         scrapeOptions: shouldScrape ? scrapeOptions : undefined,
         timeout: req.body.timeout,
         enterprise: teamEnterprise,
@@ -242,6 +433,7 @@ export async function searchController(
         integration: req.body.integration,
         apiKeyId: req.acuc?.api_key_id ?? null,
         flags: req.acuc?.flags ?? null,
+        teamPlanClass: teamPlanClass(req.acuc),
         requestId: jobId,
         jobId,
         apiVersion: "v1",
@@ -250,6 +442,10 @@ export async function searchController(
         agentIndexOnly: (req as any).agentIndexOnly ?? false,
         keylessReserved: reservedKeylessCredits > 0,
         threatProtectionPolicy: threatProtection.policy,
+        safeModeBypassed: safeMode.bypassed === true,
+        ctx,
+        body: hookBody,
+        planApplied: true,
       },
       logger,
     );
@@ -279,13 +475,30 @@ export async function searchController(
       })) as Document[];
     }
 
+    const extraWarnings = [
+      usOnlyImagesWarning,
+      result.usOnlyWarning,
+      result.toolsWarning,
+    ].filter(Boolean);
+    if (extraWarnings.length > 0) {
+      responseData.warning = [responseData.warning, ...extraWarnings]
+        .filter(Boolean)
+        .join(" ");
+    }
+
     // Bill team for search credits only
     if (!isSearchPreview) {
       billTeam(
         req.auth.team_id,
+        req.acuc?.org_id ?? null,
         result.searchCredits,
         req.acuc?.api_key_id ?? null,
-        { endpoint: "search", jobId },
+        {
+          endpoint: "search",
+          jobId,
+          chargeId: jobId,
+          externalRequestId: externalRequestId(req),
+        },
       ).catch(error => {
         logger.error(
           `Failed to bill team ${req.auth.team_id} for ${result.searchCredits} credits: ${error}`,
@@ -307,27 +520,39 @@ export async function searchController(
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - middlewareStartTime) / 1000;
 
-    logSearch(
-      {
-        id: jobId,
-        request_id: jobId,
-        query: req.body.query,
-        is_successful: true,
-        error: undefined,
-        results: responseData.data,
-        num_results: responseData.data.length,
-        time_taken: timeTakenInSeconds,
-        team_id: req.auth.team_id,
-        options: {
-          ...req.body,
-          query: undefined,
-          scrapeOptions: undefined,
-        },
-        credits_cost: result.searchCredits,
-        zeroDataRetention,
+    logSearch({
+      id: jobId,
+      request_id: jobId,
+      query: req.body.query,
+      is_successful: true,
+      error: undefined,
+      results: responseData.data,
+      num_results: responseData.data.length,
+      time_taken: timeTakenInSeconds,
+      team_id: req.auth.team_id,
+      options: {
+        ...req.body,
+        query: undefined,
+        scrapeOptions: undefined,
       },
-      false,
-    );
+      credits_cost: result.searchCredits,
+      zeroDataRetention,
+    }).catch(error => {
+      logger.error("Failed to log search", { error, jobId });
+    });
+
+    const hooks = installedService()?.hooks;
+    if (hooks?.has("search.finished")) {
+      hooks.observe("search.finished", {
+        id: jobId,
+        ctx,
+        results: result.totalResultsCount,
+        charged:
+          !isSelfHosted() && !isSearchPreview
+            ? result.searchCredits
+            : undefined,
+      });
+    }
 
     const totalRequestTime = new Date().getTime() - middlewareStartTime;
     const controllerTime = new Date().getTime() - controllerStartTime;
@@ -371,9 +596,14 @@ export async function searchController(
       });
     }
 
-    captureExceptionWithZdrCheck(error, {
-      extra: { zeroDataRetention },
-    });
+    if (error instanceof UsOnlyUnavailableError) {
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        error: error.message,
+      });
+    }
+
     logger.error("Unhandled error occurred in search", {
       version: "v1",
       error,
